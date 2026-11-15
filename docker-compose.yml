@@ -1,0 +1,73 @@
+name: connectbatack3
+
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: batack_db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-batack}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-batack_dev_password_change_me}
+      POSTGRES_DB: ${POSTGRES_DB:-connectbatack3}
+    volumes:
+      - batack_pgdata:/var/lib/postgresql/data
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-batack} -d ${POSTGRES_DB:-connectbatack3}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+
+  redis:
+    image: redis:7-alpine
+    container_name: batack_redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - batack_redisdata:/data
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: batack_api
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-batack}:${POSTGRES_PASSWORD:-batack_dev_password_change_me}@db:5432/${POSTGRES_DB:-connectbatack3}
+      REDIS_URL: redis://redis:6379/0
+      STORAGE_DIR: /app/storage
+    volumes:
+      # Persistance locale des photos, justificatifs et documents
+      - ./storage:/app/storage
+      # Permet au script de seed d'importer les photos initiales du frontend si présentes
+      - ../frontend/public/images:/app/frontend_images:ro
+      - ../frontend/src/i18n:/app/frontend_i18n:ro
+    ports:
+      - "${API_PORT:-8001}:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/api/v1/health"]
+      interval: 20s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+volumes:
+  batack_pgdata:
+  batack_redisdata:
+
