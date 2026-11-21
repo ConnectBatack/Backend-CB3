@@ -1,2 +1,1 @@
-"""Couche métier (services) de ConnectBatack 3."""
-
+"""Couche métier (services) de l'API Batack."""

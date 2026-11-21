@@ -5,6 +5,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import get_settings
+from app.core.rate_limit import rate_limiter
 from app.core.security import (
     create_access_token,
     create_refresh_token,
@@ -31,9 +32,8 @@ async def authenticate_user(
     remember_device: bool = False,
 ) -> tuple[User, str, str, str]:
     """
-    Authentifie un utilisateur et crée une session serveur + JWT.
-    Retourne (user, access_token, refresh_token, raw_session_token).
-    Les messages d'erreur restent identiques que l'e-mail existe ou non.
+    Authentifie un utilisateur et crée une session serveur + JWT liés à cette session.
+    Protection brute-force par IP (délai progressif et rate limit) sans verrouiller le compte.
     """
     settings = get_settings()
     normalized_email = email.strip().lower()
@@ -57,6 +57,7 @@ async def authenticate_user(
             details={"reason": "unknown_email"},
         )
         await db.commit()
+        await rate_limiter.record_login_failure_backoff(ip_address or "unknown")
         raise invalid_exc
 
     if not user.is_active:
@@ -70,33 +71,11 @@ async def authenticate_user(
             details={"reason": "inactive"},
         )
         await db.commit()
+        await rate_limiter.record_login_failure_backoff(ip_address or "unknown")
         raise invalid_exc
-
-    if user.locked_until is not None:
-        locked_until = (
-            user.locked_until.replace(tzinfo=UTC)
-            if user.locked_until.tzinfo is None
-            else user.locked_until
-        )
-        if locked_until > now:
-            await record_audit_log(
-                db,
-                action="auth.login_blocked_lockout",
-                resource_type="user",
-                resource_id=user.id,
-                actor=user,
-                ip_address=ip_address,
-            )
-            await db.commit()
-            raise HTTPException(
-                status_code=status.HTTP_423_LOCKED,
-                detail="Compte temporairement verrouillé suite à plusieurs échecs. Réessayez plus tard.",
-            )
 
     if not verify_password(password, user.password_hash):
         user.failed_login_attempts += 1
-        if user.failed_login_attempts >= settings.LOGIN_MAX_ATTEMPTS:
-            user.locked_until = now + timedelta(seconds=settings.LOGIN_WINDOW_SECONDS)
         await record_audit_log(
             db,
             action="auth.login_failed",
@@ -107,6 +86,7 @@ async def authenticate_user(
             details={"attempts": user.failed_login_attempts},
         )
         await db.commit()
+        await rate_limiter.record_login_failure_backoff(ip_address or "unknown")
         raise invalid_exc
 
     if user.totp_enabled:
@@ -120,34 +100,38 @@ async def authenticate_user(
                 ip_address=ip_address,
             )
             await db.commit()
+            await rate_limiter.record_login_failure_backoff(ip_address or "unknown")
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Code de double authentification (2FA) requis ou invalide.",
             )
 
-    # Rehash transparent si paramètres Argon2id mis à jour
     if needs_rehash(user.password_hash):
         user.password_hash = hash_password(password)
 
     user.failed_login_attempts = 0
     user.locked_until = None
     user.last_login_at = now
+    rate_limiter.reset_ip_failures(ip_address or "unknown")
 
     raw_session_token = generate_opaque_token(32)
-    refresh_token = create_refresh_token(user.id)
-    access_token = create_access_token(user.id, user.role.value)
-
     idle_hours = settings.SESSION_IDLE_HOURS * (30 if remember_device else 1)
+
     session = UserSession(
         user_id=user.id,
         token_hash=hash_token(raw_session_token),
-        refresh_token_hash=hash_token(refresh_token),
+        refresh_token_hash=None,
         user_agent=(user_agent or "")[:512] or None,
         ip_address=ip_address,
         expires_at=now + timedelta(hours=idle_hours),
         last_seen_at=now,
     )
     db.add(session)
+    await db.flush()
+
+    refresh_token = create_refresh_token(user.id, session.id)
+    access_token = create_access_token(user.id, user.role.value, session.id)
+    session.refresh_token_hash = hash_token(refresh_token)
 
     await record_audit_log(
         db,
@@ -174,14 +158,19 @@ async def refresh_user_tokens(
             detail="Jeton de rafraîchissement invalide ou expiré.",
         ) from exc
 
-    if payload.get("type") != "refresh" or not payload.get("sub"):
+    if payload.get("type") != "refresh" or not payload.get("sub") or not payload.get("sid"):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Type de jeton invalide.",
         )
 
     token_h = hash_token(refresh_token)
-    res = await db.execute(select(UserSession).where(UserSession.refresh_token_hash == token_h))
+    res = await db.execute(
+        select(UserSession).where(
+            UserSession.id == payload["sid"],
+            UserSession.refresh_token_hash == token_h,
+        )
+    )
     sess = res.scalar_one_or_none()
     now = datetime.now(UTC)
     if sess is None or sess.is_revoked:
@@ -205,8 +194,8 @@ async def refresh_user_tokens(
             detail="Compte inactif.",
         )
 
-    new_refresh = create_refresh_token(user.id)
-    new_access = create_access_token(user.id, user.role.value)
+    new_refresh = create_refresh_token(user.id, sess.id)
+    new_access = create_access_token(user.id, user.role.value, sess.id)
     sess.refresh_token_hash = hash_token(new_refresh)
     sess.last_seen_at = now
     if ip_address:
@@ -216,10 +205,20 @@ async def refresh_user_tokens(
 
 
 async def revoke_session(
-    db: AsyncSession, *, raw_session_token: str | None = None, user_id: str | None = None
+    db: AsyncSession,
+    *,
+    raw_session_token: str | None = None,
+    session_id: str | None = None,
+    user_id: str | None = None,
 ) -> None:
-    """Révoque une session par cookie ou toutes les sessions d'un utilisateur."""
-    if raw_session_token:
+    """Révoque une session par cookie, par session_id, ou toutes les sessions d'un utilisateur."""
+    if session_id:
+        res = await db.execute(select(UserSession).where(UserSession.id == session_id))
+        sess = res.scalar_one_or_none()
+        if sess is not None:
+            sess.is_revoked = True
+            await db.commit()
+    elif raw_session_token:
         t_hash = hash_token(raw_session_token)
         res = await db.execute(select(UserSession).where(UserSession.token_hash == t_hash))
         sess = res.scalar_one_or_none()
@@ -233,4 +232,3 @@ async def revoke_session(
         for sess in res.scalars().all():
             sess.is_revoked = True
         await db.commit()
-

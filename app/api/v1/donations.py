@@ -26,7 +26,7 @@ from app.schemas.finance import (
     DonationOut,
 )
 from app.services.audit import record_audit_log
-from app.services.ledger_service import convert_currency, create_ledger_entry
+from app.services.ledger_service import convert_currency, create_ledger_entry, ledger_write_lock
 from app.services.stripe_service import create_stripe_checkout_for_donation
 
 router = APIRouter(prefix="/donations", tags=["Dons & Paiements"])
@@ -43,7 +43,12 @@ async def create_checkout(
     return DonationCheckoutResponse(donation_id=donation.id, checkout_url=url)
 
 
-@router.post("/manual", response_model=DonationOut, status_code=status.HTTP_201_CREATED, summary="Enregistrer un don manuel (espèces, Mobile Money, virement)")
+@router.post(
+    "/manual",
+    response_model=DonationOut,
+    status_code=status.HTTP_201_CREATED,
+    summary="Enregistrer un don manuel (espèces, Mobile Money, virement — e-mail facultatif)",
+)
 async def record_manual_donation(
     payload: DonationManualCreate,
     request: Request,
@@ -71,7 +76,8 @@ async def record_manual_donation(
         status=DonationStatus.PAID,
         donor_first_name=payload.donor_first_name.strip(),
         donor_last_name=payload.donor_last_name.strip(),
-        donor_email=payload.donor_email.lower().strip(),
+        donor_email=payload.donor_email.lower().strip() if payload.donor_email else None,
+        donor_phone=payload.donor_phone.strip() if payload.donor_phone else None,
         tax_receipt_requested=payload.tax_receipt_requested,
         terms_accepted=True,
         language=payload.language,
@@ -82,36 +88,38 @@ async def record_manual_donation(
     db.add(donation)
     await db.flush()
 
-    if project is not None:
-        project.collected_amount_eur = Decimal(project.collected_amount_eur) + eur_equiv
-        project.contributors_count += 1
-
-    # L'écriture manuelle démarre à "a_contresigner" pour garantir la double vérification
-    await create_ledger_entry(
-        db,
-        entry_date=payload.entry_date or date.today(),
-        label=f"Don manuel ({method.value}) - {donation.donor_last_name}",
-        account=payload.account,
-        direction=LedgerDirection.ENTREE,
-        amount=payload.amount,
-        currency=payload.currency,
-        initial_status=LedgerStatus.A_CONTRESIGNER,
-        project_id=project.id if project else None,
-        donation_id=donation.id,
-        receipt_number=payload.receipt_reference,
-        actor=current_user,
-        ip_address=client_ip(request),
-    )
-    await record_audit_log(
-        db,
-        action="donations.manual_recorded",
-        resource_type="donation",
-        resource_id=donation.id,
-        actor=current_user,
-        ip_address=client_ip(request),
-        details={"amount_eur": str(eur_equiv), "method": method.value},
-    )
-    await db.commit()
+    # Libellé générique sans nom de donateur ; montant public mis à jour uniquement après contresignature
+    method_labels = {
+        PaymentMethod.ESPECES: "Don manuel (espèces)",
+        PaymentMethod.MOBILE_MONEY: "Don manuel (Mobile Money)",
+        PaymentMethod.VIREMENT: "Don manuel (virement)",
+    }
+    async with ledger_write_lock(db):
+        await create_ledger_entry(
+            db,
+            entry_date=payload.entry_date or date.today(),
+            label=method_labels.get(method, "Don manuel"),
+            account=payload.account,
+            direction=LedgerDirection.ENTREE,
+            amount=payload.amount,
+            currency=payload.currency,
+            initial_status=LedgerStatus.A_CONTRESIGNER,
+            project_id=project.id if project else None,
+            donation_id=donation.id,
+            receipt_number=payload.receipt_reference,
+            actor=current_user,
+            ip_address=client_ip(request),
+        )
+        await record_audit_log(
+            db,
+            action="donations.manual_recorded",
+            resource_type="donation",
+            resource_id=donation.id,
+            actor=current_user,
+            ip_address=client_ip(request),
+            details={"amount_eur": str(eur_equiv), "method": method.value},
+        )
+        await db.commit()
     await db.refresh(donation)
     return DonationOut.model_validate(donation)
 
@@ -151,4 +159,3 @@ async def get_donation(
     if donation is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Don introuvable.")
     return DonationOut.model_validate(donation)
-

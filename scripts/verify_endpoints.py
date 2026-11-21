@@ -1,6 +1,6 @@
 """
-Script de vérification de bout en bout de tous les endpoints FastAPI
-sur une instance active (PostgreSQL + Redis + stockage local).
+Script de vérification de bout en bout des endpoints FastAPI sur une instance active.
+Les identifiants sont lus depuis les variables d'environnement (aucun mot de passe codé en dur).
 """
 
 import io
@@ -15,6 +15,15 @@ from PIL import Image
 
 BASE_URL = os.getenv("BASE_URL", "http://localhost:8001").rstrip("/")
 API = f"{BASE_URL}/api/v1"
+
+ADMIN_EMAIL = os.getenv("TEST_ADMIN_EMAIL", "admin@batack.org")
+ADMIN_PASSWORD = os.getenv("TEST_ADMIN_PASSWORD", "")
+TRES_EMAIL = os.getenv("TEST_TRESORIER_EMAIL", "tresorier@batack.org")
+TRES_PASSWORD = os.getenv("TEST_TRESORIER_PASSWORD", "")
+MEMBRE_EMAIL = os.getenv("TEST_MEMBRE_EMAIL", "membre@batack.org")
+MEMBRE_PASSWORD = os.getenv("TEST_MEMBRE_PASSWORD", "")
+ENC_EMAIL = os.getenv("TEST_ENCADRANT_EMAIL", "encadrant@batack.org")
+ENC_PASSWORD = os.getenv("TEST_ENCADRANT_PASSWORD", "")
 
 
 @dataclass
@@ -53,32 +62,34 @@ def make_png_bytes() -> bytes:
 
 
 def main() -> int:
+    if not all([ADMIN_PASSWORD, TRES_PASSWORD, MEMBRE_PASSWORD, ENC_PASSWORD]):
+        print(
+            "Définissez TEST_ADMIN_PASSWORD, TEST_TRESORIER_PASSWORD, "
+            "TEST_MEMBRE_PASSWORD et TEST_ENCADRANT_PASSWORD dans l'environnement.",
+            file=sys.stderr,
+        )
+        return 2
+
     suffix = str(int(time.time()))
     with httpx.Client(timeout=20.0) as client:
-        # ------------------------------------------------------------------
-        # 1. Santé & disponibilité
-        # ------------------------------------------------------------------
         r = client.get(f"{API}/health")
         record("GET", "/api/v1/health", r, (200,), "API en ligne")
 
         r = client.get(f"{API}/ready")
         record("GET", "/api/v1/ready", r, (200,), "PostgreSQL + stockage prêts")
 
-        # ------------------------------------------------------------------
-        # 2. Authentification (login, me, refresh, 2FA, change-password, logout)
-        # ------------------------------------------------------------------
-        r = client.post(f"{API}/auth/login", json={"email": "admin@batack.org", "password": "BatackAdmin2026!"})
+        r = client.post(f"{API}/auth/login", json={"email": ADMIN_EMAIL, "password": ADMIN_PASSWORD})
         record("POST", "/api/v1/auth/login", r, (200,), "Connexion admin + cookie session")
         admin_tokens = r.json()
         admin_h = {"Authorization": f"Bearer {admin_tokens['access_token']}"}
 
-        r = client.post(f"{API}/auth/login", json={"email": "tresorier@batack.org", "password": "BatackTresorier2026!"})
+        r = client.post(f"{API}/auth/login", json={"email": TRES_EMAIL, "password": TRES_PASSWORD})
         tres_h = {"Authorization": f"Bearer {r.json()['access_token']}"}
 
-        r = client.post(f"{API}/auth/login", json={"email": "membre@batack.org", "password": "BatackMembre2026!"})
+        r = client.post(f"{API}/auth/login", json={"email": MEMBRE_EMAIL, "password": MEMBRE_PASSWORD})
         membre_h = {"Authorization": f"Bearer {r.json()['access_token']}"}
 
-        r = client.post(f"{API}/auth/login", json={"email": "encadrant@batack.org", "password": "BatackEncadrant2026!"})
+        r = client.post(f"{API}/auth/login", json={"email": ENC_EMAIL, "password": ENC_PASSWORD})
         enc_h = {"Authorization": f"Bearer {r.json()['access_token']}"}
 
         r = client.get(f"{API}/auth/me", headers=admin_h)
@@ -87,13 +98,13 @@ def main() -> int:
         r = client.post(f"{API}/auth/refresh", json={"refresh_token": admin_tokens["refresh_token"]})
         record("POST", "/api/v1/auth/refresh", r, (200,), "Rotation JWT refresh")
 
-        # ------------------------------------------------------------------
-        # 3. Administration - Utilisateurs, Rôles & Audit
-        # ------------------------------------------------------------------
         r = client.get(f"{API}/users", headers=admin_h)
         record("GET", "/api/v1/users", r, (200,), f"Total={r.json().get('total')}")
 
         temp_email = f"e2e_{suffix}@batack.org"
+        temp_pwd_1 = f"TempE2ePass_{suffix}_A1!"
+        temp_pwd_2 = f"ResetE2ePass_{suffix}_B2!"
+        temp_pwd_3 = f"ChangedE2ePass_{suffix}_C3!"
         r = client.post(
             f"{API}/users",
             headers=admin_h,
@@ -101,7 +112,7 @@ def main() -> int:
                 "email": temp_email,
                 "full_name": "Utilisateur Test E2E",
                 "role": "membre",
-                "password": "TestPassword2026!",
+                "password": temp_pwd_1,
             },
         )
         record("POST", "/api/v1/users", r, (201,), f"Créé {temp_email}")
@@ -116,55 +127,53 @@ def main() -> int:
         r = client.post(
             f"{API}/users/{temp_uid}/reset-password",
             headers=admin_h,
-            json={"new_password": "ResetPassword2026!", "must_change_password": False},
+            json={"new_password": temp_pwd_2, "must_change_password": False},
         )
         record("POST", "/api/v1/users/{user_id}/reset-password", r, (200,), "Mot de passe réinitialisé")
 
         r = client.post(f"{API}/users/{temp_uid}/unlock", headers=admin_h)
         record("POST", "/api/v1/users/{user_id}/unlock", r, (200,), "Compte déverrouillé")
 
-        # Connexion de l'utilisateur temporaire pour tester 2FA, change-password et logout
-        r_tmp_login = client.post(f"{API}/auth/login", json={"email": temp_email, "password": "ResetPassword2026!"})
+        r_tmp_login = client.post(f"{API}/auth/login", json={"email": temp_email, "password": temp_pwd_2})
         tmp_h = {"Authorization": f"Bearer {r_tmp_login.json()['access_token']}"}
 
-        r = client.post(f"{API}/auth/2fa/setup", headers=tmp_h)
+        r = client.post(f"{API}/auth/2fa/setup", headers=tmp_h, json={"current_password": temp_pwd_2})
         record("POST", "/api/v1/auth/2fa/setup", r, (200,), "Secret TOTP généré")
         totp_secret = r.json()["secret"]
 
         r = client.post(f"{API}/auth/2fa/enable", headers=tmp_h, json={"code": pyotp.TOTP(totp_secret).now()})
         record("POST", "/api/v1/auth/2fa/enable", r, (200,), "2FA activée")
 
-        r = client.post(f"{API}/auth/2fa/disable", headers=tmp_h, json={"code": pyotp.TOTP(totp_secret).now()})
+        r = client.post(
+            f"{API}/auth/2fa/disable",
+            headers=tmp_h,
+            json={"current_password": temp_pwd_2, "code": pyotp.TOTP(totp_secret).now()},
+        )
         record("POST", "/api/v1/auth/2fa/disable", r, (200,), "2FA désactivée")
 
         r = client.post(
             f"{API}/auth/change-password",
             headers=tmp_h,
-            json={"current_password": "ResetPassword2026!", "new_password": "ChangedPass2026!"},
+            json={"current_password": temp_pwd_2, "new_password": temp_pwd_3},
         )
         record("POST", "/api/v1/auth/change-password", r, (200,), "Changement mot de passe")
 
-        # Logout (avec cookie du client tmp)
         with httpx.Client(timeout=10.0) as tmp_cookie_client:
-            tmp_cookie_client.post(f"{API}/auth/login", json={"email": temp_email, "password": "ChangedPass2026!"})
+            tmp_cookie_client.post(f"{API}/auth/login", json={"email": temp_email, "password": temp_pwd_3})
             r = tmp_cookie_client.post(f"{API}/auth/logout")
             record("POST", "/api/v1/auth/logout", r, (200,), "Déconnexion & révocation cookie")
 
-        # Désactiver le compte temporaire
         client.patch(f"{API}/users/{temp_uid}", headers=admin_h, json={"is_active": False})
 
         r = client.get(f"{API}/audit-logs", headers=enc_h)
         record("GET", "/api/v1/audit-logs", r, (200,), f"Total={r.json().get('total')}")
 
-        # ------------------------------------------------------------------
-        # 4. Médias locaux (upload, list, by-slug, files, patch, delete)
-        # ------------------------------------------------------------------
         media_slug = f"test-photo-{suffix}"
         r = client.post(
             f"{API}/media/upload",
             headers=membre_h,
             files={"file": ("e2e.png", make_png_bytes(), "image/png")},
-            data={"category": "photo", "slug": media_slug, "alt_texts": '{"fr":"Photo E2E"}', "is_public": "true"},
+            data={"category": "photo", "slug": media_slug, "alt_texts": '{"fr":"Photo E2E"}'},
         )
         record("POST", "/api/v1/media/upload", r, (201,), f"Stocké localement: {r.json().get('storage_path')}")
         media_id = r.json()["id"]
@@ -188,9 +197,6 @@ def main() -> int:
         )
         record("PATCH", "/api/v1/media/{asset_id}", r, (200,), "Métadonnées mises à jour")
 
-        # ------------------------------------------------------------------
-        # 5. Projets, CMS & Vitrine publique
-        # ------------------------------------------------------------------
         proj_slug = f"projet-e2e-{suffix}"
         r = client.post(
             f"{API}/projects",
@@ -236,38 +242,23 @@ def main() -> int:
         r = client.get(f"{API}/public/transparence")
         record("GET", "/api/v1/public/transparence", r, (200,), "Vitrine transparence")
 
-        # ------------------------------------------------------------------
-        # 6. Dons, Webhook Stripe & Suivi (RGPD)
-        # ------------------------------------------------------------------
         r = client.post(
             f"{API}/donations/checkout",
             json={
                 "montant": 50,
                 "frequence": "ponctuel",
                 "moyen": "carte",
-                "projet": "dispensaire",
+                "projet": proj_slug,
                 "nom": "Testeur",
                 "email": "donateur@example.org",
                 "conditions": True,
                 "langue": "fr",
             },
         )
-        record(
-            "POST",
-            "/api/v1/donations/checkout",
-            r,
-            (200, 503),
-            "503 attendu sans clé STRIPE_SECRET_KEY (préversion)",
-        )
+        record("POST", "/api/v1/donations/checkout", r, (200, 503), "Checkout Stripe")
 
         r = client.post(f"{API}/webhooks/stripe", content=b"{}", headers={"stripe-signature": "invalid"})
-        record(
-            "POST",
-            "/api/v1/webhooks/stripe",
-            r,
-            (400, 503),
-            "503 attendu sans STRIPE_WEBHOOK_SECRET (400 si configuré)",
-        )
+        record("POST", "/api/v1/webhooks/stripe", r, (400, 503), "Webhook Stripe")
 
         r = client.post(
             f"{API}/donations/manual",
@@ -278,11 +269,11 @@ def main() -> int:
                 "currency": "EUR",
                 "payment_method": "especes",
                 "donor_last_name": f"Donateur_{suffix}",
-                "donor_email": f"don_{suffix}@example.org",
+                "donor_phone": "+237600000000",
                 "account": "Caisse",
             },
         )
-        record("POST", "/api/v1/donations/manual", r, (201,), "Don manuel enregistré")
+        record("POST", "/api/v1/donations/manual", r, (201,), "Don manuel enregistré sans e-mail")
         donation_id = r.json()["id"]
 
         r = client.get(f"{API}/donations", headers=enc_h)
@@ -293,29 +284,13 @@ def main() -> int:
 
         r = client.post(
             f"{API}/subscriptions/follow",
-            json={
-                "email": f"suivi_{suffix}@example.org",
-                "projet": proj_slug,
-                "langue": "fr",
-                "consentement": True,
-            },
+            json={"email": f"suivi_{suffix}@example.org", "projet": proj_slug, "langue": "fr", "consentement": True},
         )
-        record("POST", "/api/v1/subscriptions/follow", r, (201,), "Double opt-in initialisé")
-        confirm_tok = r.json()["confirm_token"]
-        unsub_tok = r.json()["unsubscribe_token"]
-
-        r = client.get(f"{API}/subscriptions/confirm?token={confirm_tok}")
-        record("GET", "/api/v1/subscriptions/confirm", r, (200,), "Abonnement confirmé")
+        record("POST", "/api/v1/subscriptions/follow", r, (201,), "Double opt-in envoyé sans fuite de jeton")
 
         r = client.get(f"{API}/subscriptions", headers=enc_h)
         record("GET", "/api/v1/subscriptions", r, (200,), f"Total={r.json().get('total')}")
 
-        r = client.get(f"{API}/subscriptions/unsubscribe?token={unsub_tok}")
-        record("GET", "/api/v1/subscriptions/unsubscribe", r, (200,), "Désinscription RGPD")
-
-        # ------------------------------------------------------------------
-        # 7. Registre chaîné & Transferts
-        # ------------------------------------------------------------------
         r = client.get(f"{API}/registry/entries", headers=enc_h)
         record("GET", "/api/v1/registry/entries", r, (200,), f"Total={r.json().get('total')}")
 
@@ -334,7 +309,7 @@ def main() -> int:
                 "currency": "FCFA",
             },
         )
-        record("POST", "/api/v1/registry/entries", r, (201,), "Écriture créée (à contresigner)")
+        record("POST", "/api/v1/registry/entries", r, (201,), "Écriture créée")
         entry_val_id = r.json()["id"]
 
         r = client.post(f"{API}/registry/entries/{entry_val_id}/validate", headers=tres_h)
@@ -358,7 +333,7 @@ def main() -> int:
             headers=tres_h,
             json={"reason": "Test rejet E2E"},
         )
-        record("POST", "/api/v1/registry/entries/{entry_id}/reject", r, (200,), "Écriture rejetée avec motif")
+        record("POST", "/api/v1/registry/entries/{entry_id}/reject", r, (200,), "Écriture rejetée")
 
         r = client.get(f"{API}/registry/verify-integrity", headers=enc_h)
         record("GET", "/api/v1/registry/verify-integrity", r, (200,), f"valid={r.json().get('valid')}")
@@ -378,18 +353,15 @@ def main() -> int:
                 "transfer_date": "2026-11-15",
             },
         )
-        record("POST", "/api/v1/transfers", r, (201,), "Transfert créé")
+        record("POST", "/api/v1/transfers", r, (201,), "Transfert + 2 écritures créés")
         transfer_id = r.json()["id"]
 
         r = client.get(f"{API}/transfers", headers=enc_h)
         record("GET", "/api/v1/transfers", r, (200,), f"{len(r.json())} transferts")
 
         r = client.post(f"{API}/transfers/{transfer_id}/repay", headers=tres_h)
-        record("POST", "/api/v1/transfers/{transfer_id}/repay", r, (200,), "Transfert marqué remboursé")
+        record("POST", "/api/v1/transfers/{transfer_id}/repay", r, (200,), "Transfert remboursé")
 
-        # ------------------------------------------------------------------
-        # 8. Tâches, AHP & Planification MILP v5_5
-        # ------------------------------------------------------------------
         r = client.get(f"{API}/tasks", headers=enc_h)
         record("GET", "/api/v1/tasks", r, (200,), f"{len(r.json())} tâches")
 
@@ -450,7 +422,7 @@ def main() -> int:
             headers=membre_h,
             json={"name": f"Plan E2E {suffix}", "instance_data": instance, "solver_result": solved},
         )
-        record("POST", "/api/v1/plans", r, (201,), "Plan enregistré")
+        record("POST", "/api/v1/plans", r, (201,), "Plan vérifié et enregistré")
         plan_id = r.json()["id"]
 
         r = client.get(f"{API}/plans", headers=enc_h)
@@ -462,9 +434,6 @@ def main() -> int:
         r = client.post(f"{API}/plans/{plan_id}/archive", headers=membre_h)
         record("POST", "/api/v1/plans/{plan_id}/archive", r, (200,), "Plan archivé")
 
-        # ------------------------------------------------------------------
-        # 9. Nettoyage des ressources temporaires (teste aussi les DELETE)
-        # ------------------------------------------------------------------
         r = client.delete(f"{API}/tasks/{task_id}", headers=membre_h)
         record("DELETE", "/api/v1/tasks/{task_id}", r, (200,), "Tâche E2E supprimée")
 
@@ -475,9 +444,8 @@ def main() -> int:
         record("DELETE", "/api/v1/projects/{slug}", r, (200,), "Projet E2E supprimé")
 
         r = client.delete(f"{API}/media/{media_id}", headers=membre_h)
-        record("DELETE", "/api/v1/media/{asset_id}", r, (200,), "Média E2E supprimé du disque")
+        record("DELETE", "/api/v1/media/{asset_id}", r, (200,), "Média E2E supprimé")
 
-    # Affichage du rapport
     ok_count = sum(1 for item in results if item.passed)
     fail_count = len(results) - ok_count
     print(f"\n{'METHOD':<7} {'ENDPOINT':<44} {'HTTP':<6} {'ATTENDU':<8} {'STATUT':<6} DETAIL")
@@ -492,4 +460,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
-

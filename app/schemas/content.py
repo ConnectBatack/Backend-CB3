@@ -1,3 +1,4 @@
+import re
 from datetime import datetime
 from decimal import Decimal
 from typing import Any, Literal
@@ -5,6 +6,21 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
 
 from app.models.enums import ProjectStatus, SubscriptionStatus
+
+_HTML_TAG_RE = re.compile(r"<\s*/?\s*[a-zA-Z][^>]*>")
+
+
+def _assert_plain_text_structure(value: Any) -> Any:
+    """Rejette toute balise HTML dans les contenus CMS / projets (affichage texte brut uniquement)."""
+    if isinstance(value, str):
+        if _HTML_TAG_RE.search(value):
+            raise ValueError("Les balises HTML ne sont pas autorisées dans les contenus texte.")
+        return value
+    if isinstance(value, list):
+        return [_assert_plain_text_structure(item) for item in value]
+    if isinstance(value, dict):
+        return {str(k): _assert_plain_text_structure(v) for k, v in value.items()}
+    return value
 
 
 class ProjectBase(BaseModel):
@@ -16,11 +32,14 @@ class ProjectBase(BaseModel):
     photo_id: str | None = None
     photo_slug: str | None = Field(default=None, max_length=120)
     target_amount_eur: Decimal = Field(ge=0, le=Decimal("1000000000"))
-    collected_amount_eur: Decimal = Field(default=Decimal("0.00"), ge=0, le=Decimal("1000000000"))
-    contributors_count: int = Field(default=0, ge=0)
     is_featured_need: bool = False
     display_order: int = Field(default=0, ge=0)
     status: ProjectStatus = ProjectStatus.ACTIVE
+
+    @field_validator("category", "title", "tagline", "description")
+    @classmethod
+    def check_plain_text(cls, v: dict[str, str]) -> dict[str, str]:
+        return _assert_plain_text_structure(v)
 
 
 class ProjectCreate(ProjectBase):
@@ -35,11 +54,16 @@ class ProjectUpdate(BaseModel):
     photo_id: str | None = None
     photo_slug: str | None = Field(default=None, max_length=120)
     target_amount_eur: Decimal | None = Field(default=None, ge=0, le=Decimal("1000000000"))
-    collected_amount_eur: Decimal | None = Field(default=None, ge=0, le=Decimal("1000000000"))
-    contributors_count: int | None = Field(default=None, ge=0)
     is_featured_need: bool | None = None
     display_order: int | None = Field(default=None, ge=0)
     status: ProjectStatus | None = None
+
+    @field_validator("category", "title", "tagline", "description")
+    @classmethod
+    def check_plain_text(cls, v: dict[str, str] | None) -> dict[str, str] | None:
+        if v is not None:
+            return _assert_plain_text_structure(v)
+        return v
 
 
 class ProjectOut(BaseModel):
@@ -70,6 +94,11 @@ class SiteContentUpsert(BaseModel):
     content: dict[str, Any]
     media_id: str | None = None
     is_published: bool = True
+
+    @field_validator("content")
+    @classmethod
+    def check_plain_text_content(cls, v: dict[str, Any]) -> dict[str, Any]:
+        return _assert_plain_text_structure(v)
 
 
 class SiteContentOut(BaseModel):
@@ -118,6 +147,3 @@ class SubscriptionOut(BaseModel):
 class SubscriptionActionResponse(BaseModel):
     message: str
     status: SubscriptionStatus
-    confirm_token: str | None = None
-    unsubscribe_token: str | None = None
-

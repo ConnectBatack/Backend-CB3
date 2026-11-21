@@ -5,7 +5,6 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import ALL_STAFF_ROLES, require_roles
-from app.core.config import get_settings
 from app.core.database import get_db
 from app.core.rate_limit import client_ip, rate_limiter
 from app.core.security import generate_opaque_token, hash_token
@@ -14,11 +13,17 @@ from app.models.enums import SubscriptionStatus
 from app.models.user import User
 from app.schemas.common import PaginatedResponse
 from app.schemas.content import SubscriptionActionResponse, SubscriptionCreate, SubscriptionOut
+from app.services.email_service import send_subscription_confirmation_email
 
 router = APIRouter(prefix="/subscriptions", tags=["Suivi des projets (RGPD)"])
 
 
-@router.post("/follow", response_model=SubscriptionActionResponse, status_code=status.HTTP_201_CREATED, summary="S'inscrire au suivi d'un projet (double opt-in)")
+@router.post(
+    "/follow",
+    response_model=SubscriptionActionResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="S'inscrire au suivi d'un projet (double opt-in par e-mail)",
+)
 async def follow_project(
     payload: SubscriptionCreate,
     request: Request,
@@ -71,14 +76,16 @@ async def follow_project(
         sub.unsubscribed_at = None
 
     await db.commit()
-    settings = get_settings()
-    # En développement/test, on expose les jetons pour permettre la validation sans serveur SMTP
-    expose_tokens = settings.APP_ENV in ("development", "test")
+    await send_subscription_confirmation_email(
+        to=email,
+        project_slug=project.slug,
+        language=payload.langue,
+        confirm_token=confirm_raw,
+        unsubscribe_token=unsub_raw,
+    )
     return SubscriptionActionResponse(
-        message="Inscription enregistrée. Confirmez votre adresse e-mail.",
+        message="Inscription enregistrée. Consultez votre boîte e-mail pour confirmer.",
         status=SubscriptionStatus.PENDING,
-        confirm_token=confirm_raw if expose_tokens else None,
-        unsubscribe_token=unsub_raw if expose_tokens else None,
     )
 
 
@@ -144,4 +151,3 @@ async def list_subscriptions(
     res = await db.execute(query.order_by(ProjectSubscription.created_at.desc()).limit(limit).offset(offset))
     items = [SubscriptionOut.model_validate(s) for s in res.scalars().all()]
     return PaginatedResponse(items=items, total=total, limit=limit, offset=offset)
-

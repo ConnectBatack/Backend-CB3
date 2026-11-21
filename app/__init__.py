@@ -1,2 +1,1 @@
-"""ConnectBatack 3 FastAPI Backend."""
-
+"""Batack FastAPI Backend."""

@@ -1,4 +1,4 @@
-"""Initial schema for ConnectBatack 3
+"""Initial schema for Batack API
 
 Revision ID: 0001_initial
 Revises:

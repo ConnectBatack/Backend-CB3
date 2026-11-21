@@ -5,13 +5,31 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.deps import ALL_STAFF_ROLES, PLANNING_EDITOR_ROLES, require_roles
 from app.core.database import get_db
 from app.core.rate_limit import client_ip
+from app.models.content import Project
 from app.models.planning import ProjectTask, TaskPrecedence
 from app.models.user import User
 from app.schemas.common import MessageResponse
 from app.schemas.planning import TaskCreate, TaskOut, TaskUpdate
 from app.services.audit import record_audit_log
+from app.services.solver_service import _a_un_cycle
 
 router = APIRouter(prefix="/tasks", tags=["Tâches candidates"])
+
+
+async def _assert_no_precedence_cycle(db: AsyncSession) -> None:
+    tasks_res = await db.execute(select(ProjectTask.id, ProjectTask.code_id))
+    id_to_code = {tid: cid for tid, cid in tasks_res.all()}
+    precs_res = await db.execute(select(TaskPrecedence.predecessor_id, TaskPrecedence.successor_id))
+    edges = [
+        [id_to_code[p_id], id_to_code[s_id]]
+        for p_id, s_id in precs_res.all()
+        if p_id in id_to_code and s_id in id_to_code
+    ]
+    if _a_un_cycle(list(id_to_code.values()), edges):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Les précédences forment un cycle : aucune des tâches concernées ne pourrait démarrer.",
+        )
 
 
 async def _task_to_out(db: AsyncSession, task: ProjectTask) -> TaskOut:
@@ -53,6 +71,11 @@ async def create_task(
     current_user: User = Depends(require_roles(*PLANNING_EDITOR_ROLES)),
     db: AsyncSession = Depends(get_db),
 ) -> TaskOut:
+    if payload.project_id:
+        p_res = await db.execute(select(Project.id).where(Project.id == payload.project_id))
+        if p_res.scalar_one_or_none() is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Projet introuvable.")
+
     code_id = payload.code_id
     if code_id is None:
         max_code = (await db.execute(select(func.max(ProjectTask.code_id)))).scalar_one() or 0
@@ -84,6 +107,9 @@ async def create_task(
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Prédécesseur #{pred_code} introuvable.")
         db.add(TaskPrecedence(predecessor_id=pred_task.id, successor_id=task.id))
 
+    await db.flush()
+    await _assert_no_precedence_cycle(db)
+
     await record_audit_log(
         db,
         action="tasks.created",
@@ -111,6 +137,11 @@ async def update_task(
     if task is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Tâche introuvable.")
 
+    if payload.project_id:
+        p_res = await db.execute(select(Project.id).where(Project.id == payload.project_id))
+        if p_res.scalar_one_or_none() is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Projet introuvable.")
+
     updates = payload.model_dump(exclude_unset=True, exclude={"predecessor_code_ids"})
     for k, v in updates.items():
         setattr(task, k, v)
@@ -128,6 +159,8 @@ async def update_task(
             if pred_task is None:
                 raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Prédécesseur #{pred_code} introuvable.")
             db.add(TaskPrecedence(predecessor_id=pred_task.id, successor_id=task.id))
+        await db.flush()
+        await _assert_no_precedence_cycle(db)
 
     await record_audit_log(
         db,
@@ -164,4 +197,3 @@ async def delete_task(
     )
     await db.commit()
     return MessageResponse(message="Tâche supprimée.")
-

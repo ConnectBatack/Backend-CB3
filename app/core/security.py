@@ -39,7 +39,7 @@ def needs_rehash(password_hash: str) -> bool:
 
 
 def validate_password_strength(password: str, min_length: int = 12) -> list[str]:
-    """Vérifie la robustesse minimale d'un mot de passe (politique COVIDEBA/ENSPY)."""
+    """Vérifie la robustesse minimale d'un mot de passe."""
     errors: list[str] = []
     if len(password) < min_length:
         errors.append(f"Le mot de passe doit contenir au moins {min_length} caractères.")
@@ -62,13 +62,19 @@ def hash_token(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 
-def create_access_token(subject: str, role: str, extra: dict[str, Any] | None = None) -> str:
-    """Génère un JWT d'accès de courte durée."""
+def create_access_token(
+    subject: str,
+    role: str,
+    session_id: str,
+    extra: dict[str, Any] | None = None,
+) -> str:
+    """Génère un JWT d'accès lié à une session serveur révocable."""
     settings = get_settings()
     now = datetime.now(UTC)
     payload: dict[str, Any] = {
         "sub": subject,
         "role": role,
+        "sid": session_id,
         "type": "access",
         "iat": now,
         "exp": now + timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES),
@@ -79,12 +85,13 @@ def create_access_token(subject: str, role: str, extra: dict[str, Any] | None = 
     return jwt.encode(payload, settings.SECRET_KEY, algorithm=settings.JWT_ALGORITHM)
 
 
-def create_refresh_token(subject: str) -> str:
-    """Génère un JWT de rafraîchissement."""
+def create_refresh_token(subject: str, session_id: str) -> str:
+    """Génère un JWT de rafraîchissement lié à une session serveur."""
     settings = get_settings()
     now = datetime.now(UTC)
     payload: dict[str, Any] = {
         "sub": subject,
+        "sid": session_id,
         "type": "refresh",
         "iat": now,
         "exp": now + timedelta(days=settings.REFRESH_TOKEN_EXPIRE_DAYS),
@@ -104,9 +111,10 @@ def generate_totp_secret() -> str:
     return pyotp.random_base32()
 
 
-def get_totp_uri(secret: str, email: str, issuer: str = "ConnectBatack 3") -> str:
+def get_totp_uri(secret: str, email: str, issuer: str | None = None) -> str:
     """Construit l'URI otpauth:// pour les applications TOTP."""
-    return pyotp.totp.TOTP(secret).provisioning_uri(name=email, issuer_name=issuer)
+    issuer_name = issuer or get_settings().TOTP_ISSUER_NAME
+    return pyotp.totp.TOTP(secret).provisioning_uri(name=email, issuer_name=issuer_name)
 
 
 def verify_totp_code(secret: str, code: str) -> bool:
@@ -115,4 +123,3 @@ def verify_totp_code(secret: str, code: str) -> bool:
     if not cleaned.isdigit():
         return False
     return pyotp.TOTP(secret).verify(cleaned, valid_window=1)
-

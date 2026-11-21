@@ -1,3 +1,4 @@
+import asyncio
 import time
 from collections import defaultdict, deque
 
@@ -7,10 +8,11 @@ from app.core.config import get_settings
 
 
 class SlidingWindowRateLimiter:
-    """Limiteur de requêtes par fenêtre glissante (Redis si disponible, sinon mémoire locale)."""
+    """Limiteur de requêtes par fenêtre glissante avec délai progressif (Redis ou mémoire)."""
 
     def __init__(self) -> None:
         self._buckets: dict[str, deque[float]] = defaultdict(deque)
+        self._failures: dict[str, int] = defaultdict(int)
         self._redis = None
         self._redis_checked = False
 
@@ -52,7 +54,6 @@ class SlidingWindowRateLimiter:
             except HTTPException:
                 raise
             except Exception:
-                # Repli silencieux sur le stockage en mémoire locale si Redis est indisponible
                 pass
 
         bucket = self._buckets[key]
@@ -66,17 +67,42 @@ class SlidingWindowRateLimiter:
             )
         bucket.append(now)
 
+    async def record_login_failure_backoff(self, ip: str) -> None:
+        """Applique un délai progressif par IP sans verrouiller le compte de l'utilisateur."""
+        settings = get_settings()
+        if settings.APP_ENV == "test":
+            return
+        self._failures[ip] += 1
+        attempts = self._failures[ip]
+        if attempts > 1:
+            delay = min(4.0, 0.25 * (2 ** min(attempts - 2, 4)))
+            await asyncio.sleep(delay)
+
+    def reset_ip_failures(self, ip: str) -> None:
+        self._failures.pop(ip, None)
+
     def reset(self) -> None:
         self._buckets.clear()
+        self._failures.clear()
 
 
 rate_limiter = SlidingWindowRateLimiter()
 
 
 def client_ip(request: Request) -> str:
-    """Extrait l'adresse IP du client (avec prise en charge X-Forwarded-For)."""
+    """
+    Extrait l'IP du client.
+    N'accepte X-Forwarded-For que si TRUST_PROXY_HEADERS=true et que l'émetteur
+    direct est dans TRUSTED_PROXIES (empêche l'usurpation d'IP).
+    """
+    settings = get_settings()
+    direct_ip = request.client.host if request.client else "unknown"
+    if not settings.TRUST_PROXY_HEADERS:
+        return direct_ip
+    trusted = settings.trusted_proxies_set
+    if trusted and direct_ip not in trusted:
+        return direct_ip
     forwarded = request.headers.get("x-forwarded-for")
     if forwarded:
         return forwarded.split(",")[0].strip()
-    return request.client.host if request.client else "unknown"
-
+    return direct_ip

@@ -1,8 +1,8 @@
 [project]
-name = "connectbatack3-backend"
+name = "batack-backend"
 version = "1.0.0"
-description = "Backend FastAPI complet pour la plateforme ConnectBatack 3 (dons, transparence, registre financier, AHP, planification MILP, gestion des médias)."
-requires-python = ">=3.11"
+description = "Backend FastAPI pour la plateforme Batack (dons, transparence, registre financier, AHP, planification MILP, gestion des médias)."
+requires-python = ">=3.12"
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
@@ -19,4 +19,3 @@ target-version = "py312"
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]
 ignore = ["B008", "E501"]
-

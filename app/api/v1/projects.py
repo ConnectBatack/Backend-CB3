@@ -1,3 +1,5 @@
+from decimal import Decimal
+
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -8,15 +10,22 @@ from app.core.database import get_db
 from app.core.rate_limit import client_ip
 from app.models.content import Project
 from app.models.enums import ProjectStatus
+from app.models.media import MediaAsset
 from app.models.user import User
 from app.schemas.common import MessageResponse
 from app.schemas.content import ProjectCreate, ProjectOut, ProjectUpdate
 from app.services.audit import record_audit_log
+from app.services.ledger_service import compute_project_ledger_stats
 
 router = APIRouter(prefix="/projects", tags=["Projets"])
 
 
-def to_project_out(p: Project) -> ProjectOut:
+def to_project_out(
+    p: Project,
+    *,
+    collected_eur: Decimal = Decimal("0.00"),
+    contributors_count: int = 0,
+) -> ProjectOut:
     settings = get_settings()
     prefix = settings.API_V1_PREFIX.rstrip("/")
     photo_url = None
@@ -26,7 +35,7 @@ def to_project_out(p: Project) -> ProjectOut:
         photo_url = f"{prefix}/media/files-by-slug/{p.photo_slug}"
 
     target = float(p.target_amount_eur or 0)
-    collected = float(p.collected_amount_eur or 0)
+    collected = float(collected_eur)
     progress = min(100, round((collected / target) * 100)) if target > 0 else 0
 
     return ProjectOut(
@@ -40,8 +49,8 @@ def to_project_out(p: Project) -> ProjectOut:
         photo_slug=p.photo_slug,
         photo_url=photo_url,
         target_amount_eur=p.target_amount_eur,
-        collected_amount_eur=p.collected_amount_eur,
-        contributors_count=p.contributors_count,
+        collected_amount_eur=collected_eur.quantize(Decimal("0.01")),
+        contributors_count=contributors_count,
         progress_percent=progress,
         is_featured_need=p.is_featured_need,
         display_order=p.display_order,
@@ -61,7 +70,15 @@ async def list_projects(
     if not (include_archived and current_user is not None):
         query = query.where(Project.status != ProjectStatus.ARCHIVED)
     res = await db.execute(query.order_by(Project.display_order.asc(), Project.created_at.asc()))
-    return [to_project_out(p) for p in res.scalars().all()]
+    stats = await compute_project_ledger_stats(db)
+    return [
+        to_project_out(
+            p,
+            collected_eur=stats.get(p.id, (Decimal("0.00"), 0))[0],
+            contributors_count=stats.get(p.id, (Decimal("0.00"), 0))[1],
+        )
+        for p in res.scalars().all()
+    ]
 
 
 @router.get("/{slug}", response_model=ProjectOut, summary="Détail d'un projet")
@@ -73,7 +90,9 @@ async def get_project(
     proj = res.scalar_one_or_none()
     if proj is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Projet introuvable.")
-    return to_project_out(proj)
+    stats = await compute_project_ledger_stats(db)
+    collected_eur, contributors = stats.get(proj.id, (Decimal("0.00"), 0))
+    return to_project_out(proj, collected_eur=collected_eur, contributors_count=contributors)
 
 
 @router.post("", response_model=ProjectOut, status_code=status.HTTP_201_CREATED, summary="Créer un projet")
@@ -87,8 +106,15 @@ async def create_project(
     if existing.scalar_one_or_none() is not None:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Un projet avec ce slug existe déjà.")
 
+    if payload.photo_id:
+        media_res = await db.execute(select(MediaAsset).where(MediaAsset.id == payload.photo_id))
+        if media_res.scalar_one_or_none() is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Média photo_id introuvable.")
+
     proj = Project(
         **payload.model_dump(),
+        collected_amount_eur=Decimal("0.00"),
+        contributors_count=0,
         created_by_id=current_user.id,
     )
     db.add(proj)
@@ -121,6 +147,11 @@ async def update_project(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Projet introuvable.")
 
     updates = payload.model_dump(exclude_unset=True)
+    if updates.get("photo_id"):
+        media_res = await db.execute(select(MediaAsset).where(MediaAsset.id == updates["photo_id"]))
+        if media_res.scalar_one_or_none() is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Média photo_id introuvable.")
+
     for k, v in updates.items():
         setattr(proj, k, v)
 
@@ -135,7 +166,9 @@ async def update_project(
     )
     await db.commit()
     await db.refresh(proj)
-    return to_project_out(proj)
+    stats = await compute_project_ledger_stats(db)
+    collected_eur, contributors = stats.get(proj.id, (Decimal("0.00"), 0))
+    return to_project_out(proj, collected_eur=collected_eur, contributors_count=contributors)
 
 
 @router.delete("/{slug}", response_model=MessageResponse, summary="Supprimer un projet (admin)")
@@ -163,4 +196,3 @@ async def delete_project(
     )
     await db.commit()
     return MessageResponse(message="Projet supprimé.")
-

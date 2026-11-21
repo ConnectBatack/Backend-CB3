@@ -13,6 +13,7 @@ os.environ["DATABASE_URL"] = "sqlite+aiosqlite:///:memory:"
 os.environ["STORAGE_DIR"] = _TEST_STORAGE
 os.environ["SECRET_KEY"] = "test_secret_key_for_pytest_minimum_32_characters_long_2026"
 os.environ["SEED_ON_STARTUP"] = "false"
+os.environ["SESSION_COOKIE_SECURE"] = "false"
 
 from app.core.config import get_settings  # noqa: E402
 from app.core.database import Base, get_db  # noqa: E402
@@ -21,30 +22,47 @@ from app.core.security import hash_password  # noqa: E402
 from app.main import create_app  # noqa: E402
 from app.models.enums import UserRole  # noqa: E402
 from app.models.user import User  # noqa: E402
+from app.services.email_service import email_service  # noqa: E402
 
 get_settings.cache_clear()
 
 
 @pytest_asyncio.fixture
-async def db_session() -> AsyncGenerator[AsyncSession, None]:
-    engine = create_async_engine("sqlite+aiosqlite:///:memory:", connect_args={"check_same_thread": False})
+async def session_factory(tmp_path) -> AsyncGenerator[async_sessionmaker[AsyncSession], None]:
+    db_file = tmp_path / "test.db"
+    engine = create_async_engine(
+        f"sqlite+aiosqlite:///{db_file}",
+        connect_args={"check_same_thread": False},
+    )
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
 
-    session_factory = async_sessionmaker(bind=engine, class_=AsyncSession, expire_on_commit=False)
-    async with session_factory() as session:
-        yield session
-
-    await engine.dispose()
+    factory = async_sessionmaker(bind=engine, class_=AsyncSession, expire_on_commit=False)
+    try:
+        yield factory
+    finally:
+        await engine.dispose()
 
 
 @pytest_asyncio.fixture
-async def client(db_session: AsyncSession) -> AsyncGenerator[AsyncClient, None]:
+async def db_session(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> AsyncGenerator[AsyncSession, None]:
+    async with session_factory() as session:
+        yield session
+
+
+@pytest_asyncio.fixture
+async def client(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> AsyncGenerator[AsyncClient, None]:
     rate_limiter.reset()
+    email_service.clear_outbox()
     app = create_app()
 
     async def override_get_db() -> AsyncGenerator[AsyncSession, None]:
-        yield db_session
+        async with session_factory() as session:
+            yield session
 
     app.dependency_overrides[get_db] = override_get_db
 
@@ -94,5 +112,5 @@ async def login_as(client: AsyncClient, email: str, password: str) -> dict[str, 
     resp = await client.post("/api/v1/auth/login", json={"email": email, "password": password})
     assert resp.status_code == 200, resp.text
     token = resp.json()["access_token"]
+    client.cookies.clear()
     return {"Authorization": f"Bearer {token}"}
-

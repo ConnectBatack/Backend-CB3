@@ -33,11 +33,14 @@ async def get_current_user(
 ) -> User:
     """
     Résout l'utilisateur connecté via :
-    1) En-tête `Authorization: Bearer <access_token>`
+    1) En-tête `Authorization: Bearer <access_token>` (lié à une session active en base)
     2) Cookie httpOnly `cb3_session` vérifié côté base (empreinte SHA-256).
+    Bloque toute route autre que /auth/change-password, /auth/logout et /auth/me
+    lorsque `must_change_password` est actif.
     """
     settings = get_settings()
-    user: User | None = None
+    now = datetime.now(UTC)
+    sess: UserSession | None = None
 
     if credentials and credentials.credentials:
         try:
@@ -47,13 +50,18 @@ async def get_current_user(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Jeton d'authentification invalide ou expiré.",
             ) from exc
-        if payload.get("type") != "access" or not payload.get("sub"):
+        if payload.get("type") != "access" or not payload.get("sub") or not payload.get("sid"):
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Jeton d'accès invalide.",
             )
-        res = await db.execute(select(User).where(User.id == payload["sub"]))
-        user = res.scalar_one_or_none()
+        res = await db.execute(
+            select(UserSession).where(
+                UserSession.id == payload["sid"],
+                UserSession.user_id == payload["sub"],
+            )
+        )
+        sess = res.scalar_one_or_none()
     else:
         raw_cookie = request.cookies.get(settings.SESSION_COOKIE_NAME)
         if not raw_cookie:
@@ -64,31 +72,47 @@ async def get_current_user(
         t_hash = hash_token(raw_cookie)
         res = await db.execute(select(UserSession).where(UserSession.token_hash == t_hash))
         sess = res.scalar_one_or_none()
-        now = datetime.now(UTC)
-        if sess is None or sess.is_revoked:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Session invalide ou expirée.",
-            )
-        exp = sess.expires_at.replace(tzinfo=UTC) if sess.expires_at.tzinfo is None else sess.expires_at
-        if exp <= now:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Session expirée.",
-            )
-        # Renouvellement glissant de l'inactivité
-        sess.last_seen_at = now
-        sess.expires_at = now + timedelta(hours=settings.SESSION_IDLE_HOURS)
-        await db.commit()
 
-        user_res = await db.execute(select(User).where(User.id == sess.user_id))
-        user = user_res.scalar_one_or_none()
+    if sess is None or sess.is_revoked:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Session invalide, révoquée ou expirée.",
+        )
 
+    exp = sess.expires_at.replace(tzinfo=UTC) if sess.expires_at.tzinfo is None else sess.expires_at
+    if exp <= now:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Session expirée.",
+        )
+
+    # Renouvellement glissant de la session active
+    sess.last_seen_at = now
+    sess.expires_at = now + timedelta(hours=settings.SESSION_IDLE_HOURS)
+    await db.commit()
+
+    request.state.session_id = sess.id
+
+    user_res = await db.execute(select(User).where(User.id == sess.user_id))
+    user = user_res.scalar_one_or_none()
     if user is None or not user.is_active:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Utilisateur introuvable ou désactivé.",
         )
+
+    prefix = settings.API_V1_PREFIX.rstrip("/")
+    allowed_when_pwd_change_required = {
+        f"{prefix}/auth/change-password",
+        f"{prefix}/auth/logout",
+        f"{prefix}/auth/me",
+    }
+    if user.must_change_password and request.url.path not in allowed_when_pwd_change_required:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Changement de mot de passe obligatoire avant d'accéder à cette ressource.",
+        )
+
     return user
 
 
@@ -99,7 +123,9 @@ async def get_optional_user(
 ) -> User | None:
     try:
         return await get_current_user(request=request, credentials=credentials, db=db)
-    except HTTPException:
+    except HTTPException as exc:
+        if exc.status_code == status.HTTP_403_FORBIDDEN:
+            raise
         return None
 
 
@@ -121,4 +147,3 @@ async def require_admin(
     current_user: User = Depends(require_roles(UserRole.ADMIN)),
 ) -> User:
     return current_user
-

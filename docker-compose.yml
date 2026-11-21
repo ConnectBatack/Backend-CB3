@@ -1,4 +1,4 @@
-name: connectbatack3
+name: batack-backend
 
 services:
   db:
@@ -7,14 +7,14 @@ services:
     restart: unless-stopped
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-batack}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-batack_dev_password_change_me}
-      POSTGRES_DB: ${POSTGRES_DB:-connectbatack3}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD doit être défini}
+      POSTGRES_DB: ${POSTGRES_DB:-batack}
     volumes:
       - batack_pgdata:/var/lib/postgresql/data
     ports:
-      - "${POSTGRES_PORT:-5432}:5432"
+      - "127.0.0.1:${POSTGRES_PORT:-5435}:5432"
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-batack} -d ${POSTGRES_DB:-connectbatack3}"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-batack} -d ${POSTGRES_DB:-batack}"]
       interval: 5s
       timeout: 5s
       retries: 10
@@ -24,13 +24,15 @@ services:
     image: redis:7-alpine
     container_name: batack_redis
     restart: unless-stopped
-    command: ["redis-server", "--appendonly", "yes"]
+    command: ["sh", "-c", "redis-server --appendonly yes --requirepass \"$REDIS_PASSWORD\""]
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?REDIS_PASSWORD doit être défini}
     volumes:
       - batack_redisdata:/data
     ports:
-      - "6379:6379"
+      - "127.0.0.1:${REDIS_PORT:-6379}:6379"
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: ["CMD-SHELL", "redis-cli -a \"$REDIS_PASSWORD\" ping | grep -q PONG"]
       interval: 5s
       timeout: 3s
       retries: 10
@@ -44,17 +46,14 @@ services:
     env_file:
       - .env
     environment:
-      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-batack}:${POSTGRES_PASSWORD:-batack_dev_password_change_me}@db:5432/${POSTGRES_DB:-connectbatack3}
-      REDIS_URL: redis://redis:6379/0
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-batack}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-batack}
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
       STORAGE_DIR: /app/storage
     volumes:
       # Persistance locale des photos, justificatifs et documents
       - ./storage:/app/storage
-      # Permet au script de seed d'importer les photos initiales du frontend si présentes
-      - ../frontend/public/images:/app/frontend_images:ro
-      - ../frontend/src/i18n:/app/frontend_i18n:ro
     ports:
-      - "${API_PORT:-8001}:8000"
+      - "127.0.0.1:${API_PORT:-8001}:8000"
     depends_on:
       db:
         condition: service_healthy
@@ -70,4 +69,3 @@ services:
 volumes:
   batack_pgdata:
   batack_redisdata:
-

@@ -4,14 +4,16 @@ from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.responses import StreamingResponse
-from sqlalchemy import func, select
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import ALL_STAFF_ROLES, REGISTRY_ENTRY_ROLES, require_roles
 from app.core.database import get_db
 from app.core.rate_limit import client_ip
+from app.models.content import Project
 from app.models.enums import LedgerDirection, LedgerStatus, UserRole
 from app.models.finance import LedgerEntry
+from app.models.media import MediaAsset
 from app.models.user import User
 from app.schemas.common import PaginatedResponse
 from app.schemas.finance import (
@@ -24,12 +26,46 @@ from app.schemas.finance import (
 from app.services.ledger_service import (
     compute_registry_summary,
     create_ledger_entry,
+    ledger_write_lock,
     reject_ledger_entry,
+    resolve_effective_operations,
     validate_ledger_entry,
     verify_ledger_integrity,
 )
 
 router = APIRouter(prefix="/registry", tags=["Registre financier chaîné"])
+
+
+def _resolved_to_out(item: dict) -> LedgerEntryOut:
+    e: LedgerEntry = item["entry"]
+    return LedgerEntryOut(
+        id=e.id,
+        entry_number=e.entry_number,
+        entry_type=e.entry_type,
+        entry_date=e.entry_date,
+        label=e.label,
+        account=e.account,
+        direction=e.direction,
+        amount=e.amount,
+        currency=e.currency,
+        amount_eur_equiv=e.amount_eur_equiv,
+        amount_fcfa_equiv=e.amount_fcfa_equiv,
+        status=item["effective_status"],
+        project_id=e.project_id,
+        donation_id=e.donation_id,
+        transfer_id=e.transfer_id,
+        justificatif_media_id=e.justificatif_media_id,
+        receipt_number=e.receipt_number,
+        corrects_entry_id=e.corrects_entry_id,
+        target_entry_id=e.target_entry_id,
+        created_by_id=e.created_by_id,
+        validated_by_id=item["validated_by_id"],
+        validated_at=item["validated_at"],
+        rejection_reason=item["rejection_reason"],
+        previous_hash=e.previous_hash,
+        entry_hash=e.entry_hash,
+        created_at=e.created_at,
+    )
 
 
 @router.get("/entries", response_model=PaginatedResponse[LedgerEntryOut], summary="Lister les écritures du registre")
@@ -43,25 +79,30 @@ async def list_entries(
     _: User = Depends(require_roles(*ALL_STAFF_ROLES)),
     db: AsyncSession = Depends(get_db),
 ) -> PaginatedResponse[LedgerEntryOut]:
-    query = select(LedgerEntry)
-    count_query = select(func.count(LedgerEntry.id))
-    if status_filter is not None:
-        query = query.where(LedgerEntry.status == status_filter)
-        count_query = count_query.where(LedgerEntry.status == status_filter)
-    if direction is not None:
-        query = query.where(LedgerEntry.direction == direction)
-        count_query = count_query.where(LedgerEntry.direction == direction)
-    if account:
-        query = query.where(LedgerEntry.account == account)
-        count_query = count_query.where(LedgerEntry.account == account)
-    if project_id:
-        query = query.where(LedgerEntry.project_id == project_id)
-        count_query = count_query.where(LedgerEntry.project_id == project_id)
+    res = await db.execute(select(LedgerEntry).order_by(LedgerEntry.entry_number.asc()))
+    resolved = resolve_effective_operations(list(res.scalars().all()))
 
-    total = (await db.execute(count_query)).scalar_one()
-    res = await db.execute(query.order_by(LedgerEntry.entry_number.desc()).limit(limit).offset(offset))
-    items = [LedgerEntryOut.model_validate(e) for e in res.scalars().all()]
-    return PaginatedResponse(items=items, total=total, limit=limit, offset=offset)
+    filtered = []
+    for item in reversed(resolved):
+        e: LedgerEntry = item["entry"]
+        if status_filter is not None and item["effective_status"] != status_filter:
+            continue
+        if direction is not None and e.direction != direction:
+            continue
+        if account and e.account != account:
+            continue
+        if project_id and e.project_id != project_id:
+            continue
+        filtered.append(item)
+
+    total = len(filtered)
+    page = filtered[offset : offset + limit]
+    return PaginatedResponse(
+        items=[_resolved_to_out(item) for item in page],
+        total=total,
+        limit=limit,
+        offset=offset,
+    )
 
 
 @router.get("/summary", response_model=RegistrySummaryOut, summary="Soldes et indicateurs du registre")
@@ -80,32 +121,53 @@ async def create_entry(
     current_user: User = Depends(require_roles(*REGISTRY_ENTRY_ROLES)),
     db: AsyncSession = Depends(get_db),
 ) -> LedgerEntryOut:
-    # Un membre du COVIDEBA peut soumettre une entrée (ex: Mobile Money), seul le trésorier/admin saisit les dépenses
     if current_user.role == UserRole.MEMBRE and payload.direction == LedgerDirection.SORTIE:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Seul le trésorier ou un administrateur peut enregistrer une dépense.",
         )
 
-    entry = await create_ledger_entry(
-        db,
-        entry_date=payload.entry_date,
-        label=payload.label,
-        account=payload.account,
-        direction=payload.direction,
-        amount=payload.amount,
-        currency=payload.currency,
-        initial_status=LedgerStatus.A_CONTRESIGNER,
-        project_id=payload.project_id,
-        justificatif_media_id=payload.justificatif_media_id,
-        receipt_number=payload.receipt_number,
-        corrects_entry_id=payload.corrects_entry_id,
-        actor=current_user,
-        ip_address=client_ip(request),
-    )
-    await db.commit()
+    if payload.project_id:
+        p_res = await db.execute(select(Project.id).where(Project.id == payload.project_id))
+        if p_res.scalar_one_or_none() is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Projet introuvable.")
+    if payload.justificatif_media_id:
+        m_res = await db.execute(select(MediaAsset.id).where(MediaAsset.id == payload.justificatif_media_id))
+        if m_res.scalar_one_or_none() is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Justificatif média introuvable.")
+    if payload.corrects_entry_id:
+        c_res = await db.execute(select(LedgerEntry.id).where(LedgerEntry.id == payload.corrects_entry_id))
+        if c_res.scalar_one_or_none() is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Écriture corrigée introuvable.")
+
+    async with ledger_write_lock(db):
+        entry = await create_ledger_entry(
+            db,
+            entry_date=payload.entry_date,
+            label=payload.label,
+            account=payload.account,
+            direction=payload.direction,
+            amount=payload.amount,
+            currency=payload.currency,
+            initial_status=LedgerStatus.A_CONTRESIGNER,
+            project_id=payload.project_id,
+            justificatif_media_id=payload.justificatif_media_id,
+            receipt_number=payload.receipt_number,
+            corrects_entry_id=payload.corrects_entry_id,
+            actor=current_user,
+            ip_address=client_ip(request),
+        )
+        await db.commit()
     await db.refresh(entry)
-    return LedgerEntryOut.model_validate(entry)
+    return _resolved_to_out(
+        {
+            "entry": entry,
+            "effective_status": entry.status,
+            "validated_by_id": entry.validated_by_id,
+            "validated_at": entry.validated_at,
+            "rejection_reason": entry.rejection_reason,
+        }
+    )
 
 
 @router.post("/entries/{entry_id}/validate", response_model=LedgerEntryOut, summary="Contresigner / valider une écriture")
@@ -119,8 +181,8 @@ async def validate_entry_endpoint(
     entry = res.scalar_one_or_none()
     if entry is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Écriture introuvable.")
-    updated = await validate_ledger_entry(db, entry=entry, actor=current_user, ip_address=client_ip(request))
-    return LedgerEntryOut.model_validate(updated)
+    resolved = await validate_ledger_entry(db, entry=entry, actor=current_user, ip_address=client_ip(request))
+    return _resolved_to_out(resolved)
 
 
 @router.post("/entries/{entry_id}/reject", response_model=LedgerEntryOut, summary="Rejeter une écriture avec motif")
@@ -135,10 +197,10 @@ async def reject_entry_endpoint(
     entry = res.scalar_one_or_none()
     if entry is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Écriture introuvable.")
-    updated = await reject_ledger_entry(
+    resolved = await reject_ledger_entry(
         db, entry=entry, reason=payload.reason, actor=current_user, ip_address=client_ip(request)
     )
-    return LedgerEntryOut.model_validate(updated)
+    return _resolved_to_out(resolved)
 
 
 @router.get("/verify-integrity", response_model=IntegrityCheckOut, summary="Vérifier l'intégrité de la chaîne SHA-256")
@@ -157,10 +219,10 @@ async def export_registry(
     db: AsyncSession = Depends(get_db),
 ):
     res = await db.execute(select(LedgerEntry).order_by(LedgerEntry.entry_number.asc()))
-    entries = list(res.scalars().all())
+    resolved = resolve_effective_operations(list(res.scalars().all()))
 
     if fmt == "json":
-        return [LedgerEntryOut.model_validate(e).model_dump(mode="json") for e in entries]
+        return [_resolved_to_out(item).model_dump(mode="json") for item in resolved]
 
     buf = io.StringIO()
     writer = csv.writer(buf, delimiter=";")
@@ -181,7 +243,8 @@ async def export_registry(
             "entry_hash",
         ]
     )
-    for e in entries:
+    for item in resolved:
+        e: LedgerEntry = item["entry"]
         writer.writerow(
             [
                 e.entry_number,
@@ -193,7 +256,7 @@ async def export_registry(
                 e.currency.value,
                 str(e.amount_eur_equiv),
                 str(e.amount_fcfa_equiv),
-                e.status.value,
+                item["effective_status"].value,
                 e.receipt_number or "",
                 e.previous_hash,
                 e.entry_hash,
@@ -206,4 +269,3 @@ async def export_registry(
         media_type="text/csv; charset=utf-8",
         headers={"Content-Disposition": 'attachment; filename="registre-batack.csv"'},
     )
-

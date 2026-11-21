@@ -22,6 +22,7 @@ from app.models.enums import (
     DonationFrequency,
     DonationStatus,
     LedgerDirection,
+    LedgerEntryType,
     LedgerStatus,
     PaymentMethod,
 )
@@ -69,7 +70,8 @@ class Donation(Base):
 
     donor_first_name: Mapped[str] = mapped_column(String(100), nullable=False, default="")
     donor_last_name: Mapped[str] = mapped_column(String(100), nullable=False)
-    donor_email: Mapped[str] = mapped_column(String(254), nullable=False, index=True)
+    donor_email: Mapped[str | None] = mapped_column(String(254), nullable=True, index=True)
+    donor_phone: Mapped[str | None] = mapped_column(String(32), nullable=True)
     tax_receipt_requested: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     terms_accepted: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     language: Mapped[str] = mapped_column(String(8), nullable=False, default="fr")
@@ -77,12 +79,13 @@ class Donation(Base):
     stripe_customer_id: Mapped[str | None] = mapped_column(String(120), nullable=True)
     stripe_session_id: Mapped[str | None] = mapped_column(String(120), unique=True, nullable=True, index=True)
     stripe_payment_intent_id: Mapped[str | None] = mapped_column(String(120), nullable=True)
-    stripe_subscription_id: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    stripe_subscription_id: Mapped[str | None] = mapped_column(String(120), nullable=True, index=True)
     receipt_reference: Mapped[str | None] = mapped_column(String(120), nullable=True)
 
     recorded_by_id: Mapped[str | None] = mapped_column(
         String(36), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
     )
+    retention_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     paid_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow)
 
@@ -100,14 +103,22 @@ class StripeEvent(Base):
 
 class LedgerEntry(Base):
     """
-    Registre financier immuable et chaîné par empreinte SHA-256.
-    Une écriture n'est jamais modifiée ni supprimée : une erreur est corrigée par écriture compensatoire.
+    Registre financier strictement immuable (append-only) et chaîné par empreinte SHA-256.
+    Aucune ligne n'est jamais modifiée ni supprimée :
+    - une validation ou un rejet est enregistré comme une nouvelle écriture chaînée (target_entry_id),
+    - une erreur de montant/libellé est corrigée par une écriture compensatoire (corrects_entry_id).
     """
 
     __tablename__ = "ledger_entries"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
     entry_number: Mapped[int] = mapped_column(Integer, unique=True, nullable=False, index=True)
+    entry_type: Mapped[LedgerEntryType] = mapped_column(
+        Enum(LedgerEntryType, values_callable=lambda e: [x.value for x in e], name="ledger_entry_type"),
+        nullable=False,
+        default=LedgerEntryType.OPERATION,
+        index=True,
+    )
     entry_date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
     label: Mapped[str] = mapped_column(String(255), nullable=False)
     account: Mapped[str] = mapped_column(String(120), nullable=False, index=True)
@@ -125,6 +136,7 @@ class LedgerEntry(Base):
     amount_eur_equiv: Mapped[Decimal] = mapped_column(Numeric(15, 2), nullable=False)
     amount_fcfa_equiv: Mapped[int] = mapped_column(BigInteger, nullable=False)
 
+    # Statut initial figé à la création et couvert par l'empreinte SHA-256
     status: Mapped[LedgerStatus] = mapped_column(
         Enum(LedgerStatus, values_callable=lambda e: [x.value for x in e], name="ledger_status"),
         nullable=False,
@@ -138,12 +150,18 @@ class LedgerEntry(Base):
     donation_id: Mapped[str | None] = mapped_column(
         String(36), ForeignKey("donations.id", ondelete="SET NULL"), nullable=True
     )
+    transfer_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("fund_transfers.id", ondelete="SET NULL"), nullable=True, index=True
+    )
     justificatif_media_id: Mapped[str | None] = mapped_column(
         String(36), ForeignKey("media_assets.id", ondelete="SET NULL"), nullable=True
     )
     receipt_number: Mapped[str | None] = mapped_column(String(120), nullable=True)
     corrects_entry_id: Mapped[str | None] = mapped_column(
         String(36), ForeignKey("ledger_entries.id", ondelete="SET NULL"), nullable=True
+    )
+    target_entry_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("ledger_entries.id", ondelete="SET NULL"), nullable=True, index=True
     )
 
     created_by_id: Mapped[str | None] = mapped_column(
@@ -189,4 +207,3 @@ class FundTransfer(Base):
         String(36), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
     )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow)
-

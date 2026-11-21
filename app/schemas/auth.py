@@ -65,12 +65,21 @@ class ChangePasswordRequest(BaseModel):
     new_password: str = Field(min_length=12, max_length=200)
 
 
+class TotpSetupRequest(BaseModel):
+    current_password: str = Field(min_length=1, max_length=200)
+
+
 class TotpSetupResponse(BaseModel):
     secret: str
     provisioning_uri: str
 
 
 class TotpVerifyRequest(BaseModel):
+    code: str = Field(min_length=6, max_length=12)
+
+
+class TotpDisableRequest(BaseModel):
+    current_password: str = Field(min_length=1, max_length=200)
     code: str = Field(min_length=6, max_length=12)
 
 

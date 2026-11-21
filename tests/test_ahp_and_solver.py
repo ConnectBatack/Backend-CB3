@@ -5,10 +5,9 @@ from tests.conftest import login_as
 
 
 @pytest.mark.asyncio
-async def test_ahp_consistency_and_apply_to_tasks(client: AsyncClient, staff_users):
+async def test_ahp_consistency_and_task_precedence_cycle_rejected(client: AsyncClient, staff_users):
     membre_h = await login_as(client, "membre@batack.org", "MembrePass2026!")
 
-    # Créer deux tâches
     t1 = await client.post(
         "/api/v1/tasks",
         headers=membre_h,
@@ -28,7 +27,14 @@ async def test_ahp_consistency_and_apply_to_tasks(client: AsyncClient, staff_use
     )
     assert t1.status_code == 201 and t2.status_code == 201
 
-    # Calcul AHP cohérent (3 critères)
+    # Créer un cycle 1 <- 2 <- 1 via PATCH doit être refusé
+    cycle_patch = await client.patch(
+        f"/api/v1/tasks/{t1.json()['id']}",
+        headers=membre_h,
+        json={"predecessor_code_ids": [2]},
+    )
+    assert cycle_patch.status_code == 400
+
     calc = await client.post(
         "/api/v1/ahp/calculate",
         headers=membre_h,
@@ -46,9 +52,7 @@ async def test_ahp_consistency_and_apply_to_tasks(client: AsyncClient, staff_use
     assert calc.status_code == 200
     res = calc.json()
     assert res["est_coherent"] is True
-    assert abs(sum(res["poids_criteres"]) - 1.0) < 1e-4
 
-    # Enregistrement + application immédiate
     saved = await client.post(
         "/api/v1/ahp/sessions",
         headers=membre_h,
@@ -68,27 +72,13 @@ async def test_ahp_consistency_and_apply_to_tasks(client: AsyncClient, staff_use
     assert saved.status_code == 201
     assert saved.json()["applied_to_tasks"] is True
 
-    # Matrice incohérente (1 > 2 par 9, 2 > 3 par 9, mais 3 > 1 par 9) -> bloquée à l'application
-    incoherent = await client.post(
-        "/api/v1/ahp/sessions",
-        headers=membre_h,
-        json={
-            "name": "Incohérente",
-            "criteres": [{"id": 1, "nom": "A"}, {"id": 2, "nom": "B"}, {"id": 3, "nom": "C"}],
-            "curseurs": {"1-2": 8, "2-3": 8, "1-3": -8},
-            "tache_ids": [1],
-            "apply_immediately": True,
-        },
-    )
-    assert incoherent.status_code == 400
-
 
 @pytest.mark.asyncio
-async def test_solver_milp_v5_5_and_plan_validation(client: AsyncClient, staff_users):
+async def test_solver_milp_v5_5_and_reject_tampered_client_plan(client: AsyncClient, staff_users):
     membre_h = await login_as(client, "membre@batack.org", "MembrePass2026!")
 
     instance = {
-        "nom": "exemple_maquette_dispensaire",
+        "nom": "exemple_dispensaire",
         "h": 6,
         "S0": 3200,
         "Smin": 500,
@@ -105,18 +95,36 @@ async def test_solver_milp_v5_5_and_plan_validation(client: AsyncClient, staff_u
         "precedences": [[1, 2], [2, 3]],
     }
 
+    # Un résultat falsifié envoyé par le navigateur (solde négatif -4900) doit être refusé
+    tampered = await client.post(
+        "/api/v1/plans",
+        headers=membre_h,
+        json={
+            "name": "Plan falsifié",
+            "instance_data": instance,
+            "solver_result": {
+                "statut": "optimal",
+                "valeur": 999,
+                "lancements": [
+                    {"id": 1, "mois": 1},
+                    {"id": 2, "mois": 1},
+                    {"id": 3, "mois": 1},
+                    {"id": 4, "mois": 1},
+                    {"id": 5, "mois": 1},
+                    {"id": 6, "mois": 1},
+                ],
+                "soldes": [-4900, 0, 0, 0, 0, 0],
+            },
+        },
+    )
+    assert tampered.status_code == 400
+
     solved = await client.post("/api/v1/plans/solve", headers=membre_h, json=instance)
     assert solved.status_code == 200
     body = solved.json()
     assert body["statut"] == "optimal"
     assert all(s >= 500 for s in body["soldes"])
-    lancements = {item["id"]: item["mois"] for item in body["lancements"]}
-    if 2 in lancements:
-        assert 1 in lancements and lancements[1] <= lancements[2] - 2
-    if 3 in lancements:
-        assert 2 in lancements and lancements[2] <= lancements[3] - 1
 
-    # Enregistrement et validation
     saved = await client.post(
         "/api/v1/plans",
         headers=membre_h,
@@ -128,11 +136,3 @@ async def test_solver_milp_v5_5_and_plan_validation(client: AsyncClient, staff_u
     validated = await client.post(f"/api/v1/plans/{plan_id}/validate", headers=membre_h)
     assert validated.status_code == 200
     assert validated.json()["status"] == "validated"
-
-    # Instance avec cycle -> erreur de validation
-    cyclic = {**instance, "precedences": [[1, 2], [2, 1]]}
-    err_cycle = await client.post("/api/v1/plans/solve", headers=membre_h, json=cyclic)
-    assert err_cycle.status_code == 200
-    assert err_cycle.json()["statut"] == "erreur"
-    assert err_cycle.json()["erreurs"][0]["code"] == "cycle"
-

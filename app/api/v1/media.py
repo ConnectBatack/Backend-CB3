@@ -81,7 +81,7 @@ async def upload_media(
     slug: str | None = Form(default=None),
     alt_texts: str | None = Form(default=None),
     captions: str | None = Form(default=None),
-    is_public: bool = Form(default=True),
+    is_public: bool | None = Form(default=None),
     current_user: User = Depends(require_roles(*CONTENT_EDITOR_ROLES)),
     db: AsyncSession = Depends(get_db),
 ) -> MediaAssetOut:
@@ -93,6 +93,13 @@ async def upload_media(
 
     parsed_alts = _parse_json_dict(alt_texts, "alt_texts")
     parsed_captions = _parse_json_dict(captions, "captions")
+
+    # Justificatifs, documents et autres fichiers sont privés par défaut
+    effective_public = (
+        is_public
+        if is_public is not None
+        else category in (MediaCategory.PHOTO, MediaCategory.LOGO)
+    )
 
     storage = LocalStorageManager()
     stored = await storage.save_upload(file, category=category)
@@ -110,7 +117,7 @@ async def upload_media(
         height=stored.height,
         alt_texts=parsed_alts,
         captions=parsed_captions,
-        is_public=is_public,
+        is_public=effective_public,
         uploaded_by_id=current_user.id,
     )
     db.add(asset)

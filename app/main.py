@@ -13,8 +13,9 @@ from app.services.seed import seed_database
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     settings = get_settings()
+    settings.validate_startup_security()
     LocalStorageManager().ensure_directories()
-    if settings.SEED_ON_STARTUP and settings.APP_ENV != "test":
+    if settings.SEED_ON_STARTUP and settings.APP_ENV not in ("test", "production", "staging"):
         async with AsyncSessionLocal() as db:
             await seed_database(db, include_demo_data=(settings.APP_ENV == "development"))
     yield
@@ -22,16 +23,20 @@ async def lifespan(_: FastAPI):
 
 def create_app() -> FastAPI:
     settings = get_settings()
+    settings.validate_startup_security()
+    is_prod = settings.APP_ENV == "production"
+
     app = FastAPI(
         title=settings.APP_NAME,
         version="1.0.0",
         description=(
-            "API REST complète de la plateforme ConnectBatack 3 : dons Stripe, transparence, "
-            "registre comptable chaîné, gestion des rôles COVIDEBA/ENSPY/UMONS, AHP, "
-            "planification MILP v5_5 et gestion locale des médias."
+            "API REST de la plateforme de gestion et de dons pour Batack : "
+            "dons Stripe, transparence, registre comptable chaîné, rôles COVIDEBA/ENSPY/UMONS, "
+            "AHP, planification MILP v5_5 et gestion locale des médias."
         ),
-        docs_url="/docs",
-        redoc_url="/redoc",
+        docs_url=None if is_prod else "/docs",
+        redoc_url=None if is_prod else "/redoc",
+        openapi_url=None if is_prod else "/openapi.json",
         lifespan=lifespan,
     )
 
@@ -56,4 +61,3 @@ def create_app() -> FastAPI:
 
 
 app = create_app()
-

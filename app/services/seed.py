@@ -1,5 +1,7 @@
 import hashlib
 import json
+import logging
+import os
 from datetime import date
 from decimal import Decimal
 from pathlib import Path
@@ -8,7 +10,7 @@ from PIL import Image
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.config import get_settings
+from app.core.config import FORBIDDEN_PASSWORDS, get_settings
 from app.core.security import hash_password
 from app.core.storage import LocalStorageManager
 from app.models.content import Project, SiteContent
@@ -26,27 +28,33 @@ from app.models.planning import ProjectTask, TaskPrecedence
 from app.models.user import User
 from app.services.ledger_service import create_ledger_entry
 
+logger = logging.getLogger("batack.seed")
 
-def _locate_frontend_dir() -> Path | None:
-    """Repère les ressources du frontend (en local ou montées dans Docker)."""
-    candidates = [
-        Path("/app/frontend_images").parent,  # si monté dans Docker
-        Path(__file__).resolve().parents[3] / "frontend",
-    ]
+
+def _resolve_images_dir() -> Path | None:
+    settings = get_settings()
+    candidates = []
+    if settings.FRONTEND_IMAGES_DIR:
+        candidates.append(Path(settings.FRONTEND_IMAGES_DIR))
+    candidates.append(Path(__file__).resolve().parents[3] / "frontend" / "public" / "images")
     for c in candidates:
-        if c.exists():
+        if c.exists() and c.is_dir():
             return c
     return None
 
 
 def _load_frontend_i18n() -> dict[str, dict]:
-    """Charge les dictionnaires fr/en/es/nl du frontend si disponibles pour pré-remplir les textes."""
+    """Charge les dictionnaires multilingues si le chemin configurable est présent."""
+    settings = get_settings()
     langs = ("fr", "en", "es", "nl")
     result: dict[str, dict] = {}
-    docker_i18n = Path("/app/frontend_i18n")
-    local_frontend = Path(__file__).resolve().parents[3] / "frontend" / "src" / "i18n"
-    base = docker_i18n if docker_i18n.exists() else local_frontend
-    if not base.exists():
+    candidates = []
+    if settings.FRONTEND_I18N_DIR:
+        candidates.append(Path(settings.FRONTEND_I18N_DIR))
+    candidates.append(Path(__file__).resolve().parents[3] / "frontend" / "src" / "i18n")
+
+    base = next((c for c in candidates if c.exists() and c.is_dir()), None)
+    if base is None:
         return result
     for lang in langs:
         f = base / f"{lang}.json"
@@ -59,57 +67,75 @@ def _load_frontend_i18n() -> dict[str, dict]:
 
 
 async def seed_database(db: AsyncSession, include_demo_data: bool = True) -> dict[str, int]:
-    """Initialise de manière idempotente l'administrateur, les médias locaux, les projets et données de base."""
+    """
+    Initialise de manière idempotente l'administrateur (avec changement de mot de passe
+    obligatoire), les médias locaux si disponibles, les projets et données de base.
+    Aucun mot de passe n'est codé en dur dans ce script.
+    """
     settings = get_settings()
     stats = {"users": 0, "media": 0, "projects": 0, "contents": 0, "tasks": 0, "ledger": 0}
 
-    # 1. Administrateur par défaut (+ comptes démo en développement)
-    users_to_seed = [
-        (settings.ADMIN_DEFAULT_EMAIL, settings.ADMIN_DEFAULT_NAME, UserRole.ADMIN, settings.ADMIN_DEFAULT_PASSWORD),
-    ]
-    if include_demo_data and settings.APP_ENV == "development":
-        users_to_seed.extend(
-            [
-                ("tresorier@batack.org", "Trésorier COVIDEBA", UserRole.TRESORIER, "BatackTresorier2026!"),
-                ("membre@batack.org", "Membre COVIDEBA", UserRole.MEMBRE, "BatackMembre2026!"),
-                ("encadrant@batack.org", "Encadrant UMONS", UserRole.ENCADRANT, "BatackEncadrant2026!"),
-            ]
-        )
-
+    # 1. Administrateur initial (uniquement si ADMIN_DEFAULT_PASSWORD est explicitement configuré)
     admin_user: User | None = None
-    membre_user: User | None = None
-    for email, full_name, role, pwd in users_to_seed:
-        norm_email = email.strip().lower()
+    admin_pwd = settings.ADMIN_DEFAULT_PASSWORD.strip()
+    if admin_pwd:
+        if admin_pwd in FORBIDDEN_PASSWORDS or admin_pwd.startswith("CHANGE_ME"):
+            raise RuntimeError("ADMIN_DEFAULT_PASSWORD utilise un mot de passe interdit/générique.")
+        norm_email = settings.ADMIN_DEFAULT_EMAIL.strip().lower()
         res = await db.execute(select(User).where(User.email == norm_email))
-        existing = res.scalar_one_or_none()
-        if existing is None:
-            u = User(
+        admin_user = res.scalar_one_or_none()
+        if admin_user is None:
+            admin_user = User(
                 email=norm_email,
-                full_name=full_name,
-                role=role,
-                password_hash=hash_password(pwd),
+                full_name=settings.ADMIN_DEFAULT_NAME,
+                role=UserRole.ADMIN,
+                password_hash=hash_password(admin_pwd),
                 is_active=True,
+                must_change_password=True,
             )
-            db.add(u)
+            db.add(admin_user)
             await db.flush()
             stats["users"] += 1
-            existing = u
-        if role == UserRole.ADMIN:
-            admin_user = existing
-        if role == UserRole.MEMBRE:
-            membre_user = existing
+    else:
+        res = await db.execute(select(User).where(User.role == UserRole.ADMIN).limit(1))
+        admin_user = res.scalar_one_or_none()
 
-    # 2. Importation des photos & logos depuis frontend/public/images vers backend/storage/
+    # Comptes de démo optionnels uniquement si SEED_DEMO_PASSWORD est fourni en dev
+    membre_user: User | None = None
+    demo_pwd = os.getenv("SEED_DEMO_PASSWORD", "").strip()
+    if include_demo_data and settings.APP_ENV == "development" and demo_pwd:
+        if demo_pwd in FORBIDDEN_PASSWORDS:
+            raise RuntimeError("SEED_DEMO_PASSWORD utilise un mot de passe interdit.")
+        for email, full_name, role in [
+            ("tresorier@batack.org", "Trésorier COVIDEBA", UserRole.TRESORIER),
+            ("membre@batack.org", "Membre COVIDEBA", UserRole.MEMBRE),
+            ("encadrant@batack.org", "Encadrant UMONS", UserRole.ENCADRANT),
+        ]:
+            res = await db.execute(select(User).where(User.email == email))
+            u = res.scalar_one_or_none()
+            if u is None:
+                u = User(
+                    email=email,
+                    full_name=full_name,
+                    role=role,
+                    password_hash=hash_password(demo_pwd),
+                    is_active=True,
+                    must_change_password=True,
+                )
+                db.add(u)
+                await db.flush()
+                stats["users"] += 1
+            if role == UserRole.MEMBRE:
+                membre_user = u
+
+    # 2. Importation optionnelle des photos & logos depuis FRONTEND_IMAGES_DIR
     i18n = _load_frontend_i18n()
     storage = LocalStorageManager()
     storage.ensure_directories()
 
-    docker_imgs = Path("/app/frontend_images")
-    local_imgs = Path(__file__).resolve().parents[3] / "frontend" / "public" / "images"
-    images_dir = docker_imgs if docker_imgs.exists() else local_imgs
-
+    images_dir = _resolve_images_dir()
     media_by_slug: dict[str, MediaAsset] = {}
-    if images_dir.exists():
+    if images_dir is not None:
         image_files = list(images_dir.glob("*.jpg")) + list((images_dir / "logos").glob("*.png"))
         for img_path in sorted(image_files):
             slug = img_path.stem
@@ -168,19 +194,24 @@ async def seed_database(db: AsyncSession, include_demo_data: bool = True) -> dic
             await db.flush()
             media_by_slug[slug] = asset
             stats["media"] += 1
+    else:
+        logger.info("Aucun dossier d'images frontend détecté (FRONTEND_IMAGES_DIR non défini ou absent).")
 
-    # 3. Projets vitrine (alignés avec frontend/src/donnees/projets.js)
+    # 3. Projets vitrine
     default_projects = [
-        ("dispensaire", "dispensaire-facade", Decimal("4200.00"), Decimal("12000.00"), 37, True, 1),
-        ("batteries", "panneau-solaire", Decimal("900.00"), Decimal("3000.00"), 12, False, 2),
-        ("ecole", "salle-de-classe", Decimal("650.00"), Decimal("1200.00"), 9, False, 3),
-        ("eau", "batack-paysage", Decimal("300.00"), Decimal("5000.00"), 4, False, 4),
-        ("marche", "marche", Decimal("0.00"), Decimal("4000.00"), 0, False, 5),
-        ("route", "batack-paysage", Decimal("0.00"), Decimal("8000.00"), 0, False, 6),
+        ("dispensaire", "dispensaire-facade", Decimal("12000.00"), True, 1),
+        ("batteries", "panneau-solaire", Decimal("3000.00"), False, 2),
+        ("ecole", "salle-de-classe", Decimal("1200.00"), False, 3),
+        ("eau", "batack-paysage", Decimal("5000.00"), False, 4),
+        ("marche", "marche", Decimal("4000.00"), False, 5),
+        ("route", "batack-paysage", Decimal("8000.00"), False, 6),
     ]
-    for slug, photo_slug, collected, target, contributors, featured, order in default_projects:
+    projects_by_slug: dict[str, Project] = {}
+    for slug, photo_slug, target, featured, order in default_projects:
         res = await db.execute(select(Project).where(Project.slug == slug))
-        if res.scalar_one_or_none() is not None:
+        existing_p = res.scalar_one_or_none()
+        if existing_p is not None:
+            projects_by_slug[slug] = existing_p
             continue
 
         cat_dict, title_dict, tag_dict, desc_dict = {}, {}, {}, {}
@@ -204,8 +235,8 @@ async def seed_database(db: AsyncSession, include_demo_data: bool = True) -> dic
             photo_id=photo_asset.id if photo_asset else None,
             photo_slug=photo_slug,
             target_amount_eur=target,
-            collected_amount_eur=collected,
-            contributors_count=contributors,
+            collected_amount_eur=Decimal("0.00"),
+            contributors_count=0,
             is_featured_need=featured,
             display_order=order,
             status=ProjectStatus.ACTIVE,
@@ -213,9 +244,10 @@ async def seed_database(db: AsyncSession, include_demo_data: bool = True) -> dic
         )
         db.add(proj)
         await db.flush()
+        projects_by_slug[slug] = proj
         stats["projects"] += 1
 
-    # 4. Contenus éditoriaux de base (diaporama accueil, prochain besoin)
+    # 4. Contenus éditoriaux
     if i18n:
         contents_seed = [
             (
@@ -236,8 +268,6 @@ async def seed_database(db: AsyncSession, include_demo_data: bool = True) -> dic
                 "accueil",
                 {
                     "projet_slug": "dispensaire",
-                    "collecte_eur": 1400,
-                    "objectif_eur": 4000,
                     "textes": {
                         lang: {
                             "titre": (d.get("accueil") or {}).get("besoinTitre", ""),
@@ -262,12 +292,11 @@ async def seed_database(db: AsyncSession, include_demo_data: bool = True) -> dic
                 )
                 stats["contents"] += 1
 
-    # 5. Tâches d'exemple et précédences (alignées avec frontend/src/donnees/exemple-gestion.js)
-    if include_demo_data:
+    # 5. Tâches & écritures d'exemple uniquement en développement
+    if include_demo_data and settings.APP_ENV == "development":
         existing_tasks = await db.execute(select(ProjectTask).limit(1))
         if existing_tasks.scalar_one_or_none() is None:
-            disp_res = await db.execute(select(Project).where(Project.slug == "dispensaire"))
-            disp = disp_res.scalar_one_or_none()
+            disp = projects_by_slug.get("dispensaire")
             sample_tasks = [
                 (1, "Toiture du dispensaire", Decimal("2500.00"), 2, Decimal("9.0")),
                 (2, "Câblage électrique", Decimal("1200.00"), 1, Decimal("8.0")),
@@ -299,17 +328,17 @@ async def seed_database(db: AsyncSession, include_demo_data: bool = True) -> dic
                     )
                 )
 
-        # 6. Écritures initiales du registre si vide
         existing_ledger = await db.execute(select(LedgerEntry).limit(1))
         if existing_ledger.scalar_one_or_none() is None:
+            disp = projects_by_slug.get("dispensaire")
             sample_entries = [
-                (date(2026, 10, 15), "Solde initial reporté", "Banque du COVIDEBA", LedgerDirection.ENTREE, Decimal("2000.00"), Currency.EUR, LedgerStatus.VALIDEE),
-                (date(2026, 10, 28), "Reversement de l'institution agréée", "Banque du COVIDEBA", LedgerDirection.ENTREE, Decimal("1200.00"), Currency.EUR, LedgerStatus.VALIDEE),
-                (date(2026, 11, 2), "Achat de câbles électriques", "Caisse", LedgerDirection.SORTIE, Decimal("45000.00"), Currency.FCFA, LedgerStatus.VALIDEE),
-                (date(2026, 11, 6), "Cotisation Mobile Money", "Mobile Money", LedgerDirection.ENTREE, Decimal("32800.00"), Currency.FCFA, LedgerStatus.A_CONTRESIGNER),
-                (date(2026, 11, 8), "Don en ligne (Stripe)", "Fonds chez l'institution agréée", LedgerDirection.ENTREE, Decimal("50.00"), Currency.EUR, LedgerStatus.VALIDEE),
+                (date(2026, 10, 15), "Solde initial reporté", "Banque du COVIDEBA", LedgerDirection.ENTREE, Decimal("2000.00"), Currency.EUR, LedgerStatus.VALIDEE, disp.id if disp else None),
+                (date(2026, 10, 28), "Reversement de l'institution agréée", "Banque du COVIDEBA", LedgerDirection.ENTREE, Decimal("1200.00"), Currency.EUR, LedgerStatus.VALIDEE, disp.id if disp else None),
+                (date(2026, 11, 2), "Achat de câbles électriques", "Caisse", LedgerDirection.SORTIE, Decimal("45000.00"), Currency.FCFA, LedgerStatus.VALIDEE, disp.id if disp else None),
+                (date(2026, 11, 6), "Cotisation Mobile Money", "Mobile Money", LedgerDirection.ENTREE, Decimal("32800.00"), Currency.FCFA, LedgerStatus.A_CONTRESIGNER, disp.id if disp else None),
+                (date(2026, 11, 8), "Don en ligne (Stripe)", "Fonds chez l'institution agréée", LedgerDirection.ENTREE, Decimal("50.00"), Currency.EUR, LedgerStatus.VALIDEE, disp.id if disp else None),
             ]
-            for d_date, lbl, acc, dir_, amt, cur, st in sample_entries:
+            for d_date, lbl, acc, dir_, amt, cur, st, pid in sample_entries:
                 await create_ledger_entry(
                     db,
                     entry_date=d_date,
@@ -319,10 +348,10 @@ async def seed_database(db: AsyncSession, include_demo_data: bool = True) -> dic
                     amount=amt,
                     currency=cur,
                     initial_status=st,
+                    project_id=pid,
                     actor=membre_user if st == LedgerStatus.A_CONTRESIGNER else admin_user,
                 )
                 stats["ledger"] += 1
 
     await db.commit()
     return stats
-

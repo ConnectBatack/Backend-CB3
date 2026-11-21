@@ -8,12 +8,24 @@ from app.api.v1.projects import to_project_out
 from app.core.config import PARITE_FCFA, get_settings
 from app.core.database import get_db
 from app.models.content import Project, SiteContent
-from app.models.enums import DonationStatus, LedgerStatus, ProjectStatus
-from app.models.finance import Donation, LedgerEntry
+from app.models.enums import LedgerDirection, LedgerStatus, ProjectStatus
+from app.models.finance import LedgerEntry
+from app.models.media import MediaAsset
 from app.schemas.finance import PublicLedgerItemOut, TransparencyOut
-from app.services.ledger_service import compute_registry_summary
+from app.services.ledger_service import (
+    compute_project_ledger_stats,
+    compute_registry_summary,
+    resolve_effective_operations,
+)
 
 router = APIRouter(prefix="/public", tags=["Vitrine publique"])
+
+
+def _public_safe_label(entry: LedgerEntry) -> str:
+    """Garantit qu'aucune donnée personnelle (nom de donateur) n'apparaît dans la vitrine publique."""
+    if entry.donation_id is not None:
+        return "Don en ligne (Stripe)" if entry.account == "Fonds chez l'institution agréée" else "Don enregistré"
+    return entry.label
 
 
 @router.get("/home", summary="Données complètes de la page d'accueil")
@@ -23,7 +35,15 @@ async def get_public_home(db: AsyncSession = Depends(get_db)) -> dict:
         .where(Project.status != ProjectStatus.ARCHIVED)
         .order_by(Project.display_order.asc(), Project.created_at.asc())
     )
-    projects = [to_project_out(p) for p in proj_res.scalars().all()]
+    stats = await compute_project_ledger_stats(db)
+    projects = [
+        to_project_out(
+            p,
+            collected_eur=stats.get(p.id, (Decimal("0.00"), 0))[0],
+            contributors_count=stats.get(p.id, (Decimal("0.00"), 0))[1],
+        )
+        for p in proj_res.scalars().all()
+    ]
     featured_need = next((p for p in projects if p.is_featured_need), projects[0] if projects else None)
 
     contents_res = await db.execute(
@@ -44,31 +64,49 @@ async def get_public_transparency(db: AsyncSession = Depends(get_db)) -> Transpa
     prefix = settings.API_V1_PREFIX.rstrip("/")
     summary = await compute_registry_summary(db)
 
-    donors_count = (
-        await db.execute(select(func.count(Donation.id)).where(Donation.status == DonationStatus.PAID))
-    ).scalar_one()
     projects_count = (
         await db.execute(select(func.count(Project.id)).where(Project.status != ProjectStatus.ARCHIVED))
     ).scalar_one()
 
-    entries_res = await db.execute(
-        select(LedgerEntry)
-        .where(LedgerEntry.status == LedgerStatus.VALIDEE)
-        .order_by(LedgerEntry.entry_number.desc())
-        .limit(30)
+    all_res = await db.execute(select(LedgerEntry).order_by(LedgerEntry.entry_number.asc()))
+    resolved = resolve_effective_operations(list(all_res.scalars().all()))
+
+    validated_ops = [
+        item["entry"]
+        for item in resolved
+        if item["effective_status"] == LedgerStatus.VALIDEE
+    ]
+    donors_count = sum(
+        1
+        for e in validated_ops
+        if e.direction == LedgerDirection.ENTREE and e.donation_id is not None
     )
+
+    recent_ops = sorted(validated_ops, key=lambda e: e.entry_number, reverse=True)[:30]
+    media_ids = [e.justificatif_media_id for e in recent_ops if e.justificatif_media_id]
+    public_media_ids: set[str] = set()
+    if media_ids:
+        m_res = await db.execute(
+            select(MediaAsset.id).where(MediaAsset.id.in_(media_ids), MediaAsset.is_public.is_(True))
+        )
+        public_media_ids = set(m_res.scalars().all())
+
     recent_entries = [
         PublicLedgerItemOut(
             entry_number=e.entry_number,
             entry_date=e.entry_date,
-            label=e.label,
+            label=_public_safe_label(e),
             account=e.account,
             direction=e.direction,
             amount_eur_equiv=Decimal(e.amount_eur_equiv),
             entry_hash=e.entry_hash,
-            justificatif_url=f"{prefix}/media/files/{e.justificatif_media_id}" if e.justificatif_media_id else None,
+            justificatif_url=(
+                f"{prefix}/media/files/{e.justificatif_media_id}"
+                if e.justificatif_media_id and e.justificatif_media_id in public_media_ids
+                else None
+            ),
         )
-        for e in entries_res.scalars().all()
+        for e in recent_ops
     ]
 
     return TransparencyOut(
@@ -80,4 +118,3 @@ async def get_public_transparency(db: AsyncSession = Depends(get_db)) -> Transpa
         parity_fcfa_per_eur=PARITE_FCFA,
         recent_entries=recent_entries,
     )
-

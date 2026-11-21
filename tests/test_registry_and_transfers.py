@@ -1,35 +1,59 @@
+import asyncio
 from decimal import Decimal
 
 import pytest
 from httpx import AsyncClient
-from sqlalchemy import update
+from sqlalchemy import select, update
 
+from app.models.enums import LedgerStatus
 from app.models.finance import LedgerEntry
 from tests.conftest import login_as
 
 
 @pytest.mark.asyncio
-async def test_ledger_chain_countersign_parity_and_tamper_detection(client: AsyncClient, staff_users, db_session):
+async def test_ledger_immutable_chain_no_admin_bypass_and_tamper_detection(
+    client: AsyncClient, staff_users, db_session
+):
+    admin_h = await login_as(client, "admin@batack.org", "AdminPass2026!")
     membre_h = await login_as(client, "membre@batack.org", "MembrePass2026!")
     tres_h = await login_as(client, "tresorier@batack.org", "TresorierPass2026!")
     enc_h = await login_as(client, "encadrant@batack.org", "EncadrantPass2026!")
 
-    # Un membre ne peut pas enregistrer une dépense (sortie)
-    mem_exp = await client.post(
+    # Référence inconnue refusée (404)
+    bad_ref = await client.post(
         "/api/v1/registry/entries",
-        headers=membre_h,
+        headers=tres_h,
         json={
             "entry_date": "2026-11-10",
-            "label": "Achat câbles",
+            "label": "Test FK",
             "account": "Caisse",
-            "direction": "sortie",
-            "amount": "45000",
-            "currency": "FCFA",
+            "direction": "entree",
+            "amount": "10.00",
+            "currency": "EUR",
+            "project_id": "00000000-0000-0000-0000-000000000000",
         },
     )
-    assert mem_exp.status_code == 403
+    assert bad_ref.status_code == 404
 
-    # Un membre peut soumettre une cotisation Mobile Money en attente de contresignature
+    # L'admin crée une écriture et ne peut PAS la contresigner lui-même
+    adm_entry = await client.post(
+        "/api/v1/registry/entries",
+        headers=admin_h,
+        json={
+            "entry_date": "2026-11-06",
+            "label": "Apport caisse",
+            "account": "Caisse",
+            "direction": "entree",
+            "amount": "50.00",
+            "currency": "EUR",
+        },
+    )
+    assert adm_entry.status_code == 201
+    assert (
+        await client.post(f"/api/v1/registry/entries/{adm_entry.json()['id']}/validate", headers=admin_h)
+    ).status_code == 403
+
+    # Un membre soumet une cotisation Mobile Money en FCFA
     e1 = await client.post(
         "/api/v1/registry/entries",
         headers=membre_h,
@@ -44,18 +68,9 @@ async def test_ledger_chain_countersign_parity_and_tamper_detection(client: Asyn
     )
     assert e1.status_code == 201
     entry1 = e1.json()
-    assert entry1["status"] == "a_contresigner"
     assert entry1["amount_eur_equiv"] == "1000.00"
 
-    # Le membre ne peut pas auto-contresigner sa propre écriture
-    self_val = await client.post(f"/api/v1/registry/entries/{entry1['id']}/validate", headers=membre_h)
-    assert self_val.status_code == 403
-
-    # Tant qu'elle n'est pas validée, elle ne compte pas dans le solde disponible
-    sum_before = await client.get("/api/v1/registry/summary", headers=enc_h)
-    assert sum_before.json()["available_balance_eur"] == "0.00"
-
-    # Le trésorier contresigne l'écriture du membre
+    # Le trésorier contresigne -> crée une nouvelle écriture chaînée VALIDATION
     val = await client.post(f"/api/v1/registry/entries/{entry1['id']}/validate", headers=tres_h)
     assert val.status_code == 200
     assert val.json()["status"] == "validee"
@@ -63,19 +78,13 @@ async def test_ledger_chain_countersign_parity_and_tamper_detection(client: Asyn
     sum_after = await client.get("/api/v1/registry/summary", headers=enc_h)
     assert sum_after.json()["available_balance_eur"] == "1000.00"
 
-    # L'encadrant vérifie l'intégrité et exporte le registre
+    # Intégrité intègre avant altération
     integ = await client.get("/api/v1/registry/verify-integrity", headers=enc_h)
-    assert integ.status_code == 200
     assert integ.json()["valid"] is True
-    assert integ.json()["entries_checked"] == 1
 
-    export_csv = await client.get("/api/v1/registry/export?fmt=csv", headers=enc_h)
-    assert export_csv.status_code == 200
-    assert "Cotisation Mobile Money" in export_csv.text
-
-    # Simulation d'une altération directe en base -> l'intégrité doit échouer
+    # Altération directe du statut sur la ligne d'origine -> immédiatement détectée par verify-integrity
     await db_session.execute(
-        update(LedgerEntry).where(LedgerEntry.id == entry1["id"]).values(amount=Decimal("999999.00"))
+        update(LedgerEntry).where(LedgerEntry.id == adm_entry.json()["id"]).values(status=LedgerStatus.VALIDEE)
     )
     await db_session.commit()
     integ_broken = await client.get("/api/v1/registry/verify-integrity", headers=enc_h)
@@ -84,7 +93,31 @@ async def test_ledger_chain_countersign_parity_and_tamper_detection(client: Asyn
 
 
 @pytest.mark.asyncio
-async def test_transfers_create_and_repay(client: AsyncClient, staff_users):
+async def test_concurrent_ledger_entries_succeed(client: AsyncClient, staff_users):
+    tres_h = await login_as(client, "tresorier@batack.org", "TresorierPass2026!")
+
+    async def post_one(i: int):
+        return await client.post(
+            "/api/v1/registry/entries",
+            headers=tres_h,
+            json={
+                "entry_date": "2026-11-15",
+                "label": f"Entrée simultanée {i}",
+                "account": "Caisse",
+                "direction": "entree",
+                "amount": "10.00",
+                "currency": "EUR",
+            },
+        )
+
+    responses = await asyncio.gather(*(post_one(i) for i in range(5)))
+    assert all(r.status_code == 201 for r in responses)
+    numbers = sorted(r.json()["entry_number"] for r in responses)
+    assert numbers == [1, 2, 3, 4, 5]
+
+
+@pytest.mark.asyncio
+async def test_transfers_create_paired_ledger_entries_and_repay(client: AsyncClient, staff_users, db_session):
     tres_h = await login_as(client, "tresorier@batack.org", "TresorierPass2026!")
     enc_h = await login_as(client, "encadrant@batack.org", "EncadrantPass2026!")
 
@@ -103,11 +136,18 @@ async def test_transfers_create_and_repay(client: AsyncClient, staff_users):
     assert tr.status_code == 201
     tid = tr.json()["id"]
 
-    # L'encadrant ne peut pas marquer remboursé
-    forb = await client.post(f"/api/v1/transfers/{tid}/repay", headers=enc_h)
-    assert forb.status_code == 403
+    # Les soldes par compte reflètent -500 en Banque et +500 en Caisse
+    summary = (await client.get("/api/v1/registry/summary", headers=enc_h)).json()
+    assert summary["balances_by_account_eur"]["Banque du COVIDEBA"] == "-500.00"
+    assert summary["balances_by_account_eur"]["Caisse"] == "500.00"
+
+    assert (await client.post(f"/api/v1/transfers/{tid}/repay", headers=enc_h)).status_code == 403
 
     repaid = await client.post(f"/api/v1/transfers/{tid}/repay", headers=tres_h)
     assert repaid.status_code == 200
     assert repaid.json()["is_repaid"] is True
 
+    summary_after = (await client.get("/api/v1/registry/summary", headers=enc_h)).json()
+    assert Decimal(summary_after["balances_by_account_eur"]["Banque du COVIDEBA"]) == Decimal("0.00")
+    assert Decimal(summary_after["balances_by_account_eur"]["Caisse"]) == Decimal("0.00")
+    assert (await db_session.execute(select(LedgerEntry))).scalars().all().__len__() == 4

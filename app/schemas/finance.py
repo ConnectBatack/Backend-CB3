@@ -9,6 +9,7 @@ from app.models.enums import (
     DonationFrequency,
     DonationStatus,
     LedgerDirection,
+    LedgerEntryType,
     LedgerStatus,
     PaymentMethod,
 )
@@ -56,7 +57,8 @@ class DonationManualCreate(BaseModel):
     payment_method: Literal["mobile_money", "especes", "virement"]
     donor_first_name: str = Field(default="", max_length=100)
     donor_last_name: str = Field(min_length=1, max_length=100)
-    donor_email: EmailStr
+    donor_email: EmailStr | None = None
+    donor_phone: str | None = Field(default=None, max_length=32)
     tax_receipt_requested: bool = False
     language: Literal["fr", "en", "es", "nl"] = "fr"
     receipt_reference: str | None = Field(default=None, max_length=120)
@@ -77,7 +79,8 @@ class DonationOut(BaseModel):
     status: DonationStatus
     donor_first_name: str
     donor_last_name: str
-    donor_email: EmailStr
+    donor_email: EmailStr | None
+    donor_phone: str | None
     tax_receipt_requested: bool
     language: str
     stripe_session_id: str | None
@@ -108,6 +111,7 @@ class LedgerEntryOut(BaseModel):
 
     id: str
     entry_number: int
+    entry_type: LedgerEntryType
     entry_date: date
     label: str
     account: str
@@ -119,9 +123,11 @@ class LedgerEntryOut(BaseModel):
     status: LedgerStatus
     project_id: str | None
     donation_id: str | None
+    transfer_id: str | None
     justificatif_media_id: str | None
     receipt_number: str | None
     corrects_entry_id: str | None
+    target_entry_id: str | None
     created_by_id: str | None
     validated_by_id: str | None
     validated_at: datetime | None

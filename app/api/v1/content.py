@@ -6,6 +6,7 @@ from app.api.deps import CONTENT_EDITOR_ROLES, get_optional_user, require_admin,
 from app.core.database import get_db
 from app.core.rate_limit import client_ip
 from app.models.content import SiteContent
+from app.models.media import MediaAsset
 from app.models.user import User
 from app.schemas.common import MessageResponse
 from app.schemas.content import SiteContentOut, SiteContentUpsert
@@ -50,6 +51,10 @@ async def upsert_content(
     current_user: User = Depends(require_roles(*CONTENT_EDITOR_ROLES)),
     db: AsyncSession = Depends(get_db),
 ) -> SiteContentOut:
+    if payload.media_id:
+        m_res = await db.execute(select(MediaAsset.id).where(MediaAsset.id == payload.media_id))
+        if m_res.scalar_one_or_none() is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Média introuvable.")
     res = await db.execute(select(SiteContent).where(SiteContent.key == key))
     item = res.scalar_one_or_none()
     if item is None:

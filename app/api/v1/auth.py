@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.deps import get_current_user
+from app.api.deps import get_current_user, get_optional_user
 from app.core.config import get_settings
 from app.core.database import get_db
 from app.core.rate_limit import client_ip, rate_limiter
@@ -19,6 +19,8 @@ from app.schemas.auth import (
     LoginRequest,
     RefreshRequest,
     TokenResponse,
+    TotpDisableRequest,
+    TotpSetupRequest,
     TotpSetupResponse,
     TotpVerifyRequest,
     UserOut,
@@ -45,7 +47,7 @@ async def login(
         window_seconds=settings.LOGIN_WINDOW_SECONDS,
     )
     await rate_limiter.check(
-        f"login:email:{payload.email.lower()}",
+        f"login:ip_email:{ip}:{payload.email.lower()}",
         max_requests=settings.LOGIN_MAX_ATTEMPTS,
         window_seconds=settings.LOGIN_WINDOW_SECONDS,
     )
@@ -101,11 +103,16 @@ async def refresh_tokens(
 async def logout(
     request: Request,
     response: Response,
+    current_user: User | None = Depends(get_optional_user),
     db: AsyncSession = Depends(get_db),
 ) -> MessageResponse:
     settings = get_settings()
     raw_cookie = request.cookies.get(settings.SESSION_COOKIE_NAME)
-    await revoke_session(db, raw_session_token=raw_cookie)
+    session_id = getattr(request.state, "session_id", None) if current_user else None
+    if session_id:
+        await revoke_session(db, session_id=session_id)
+    if raw_cookie:
+        await revoke_session(db, raw_session_token=raw_cookie)
     response.delete_cookie(key=settings.SESSION_COOKIE_NAME, path="/")
     return MessageResponse(message="Déconnexion effectuée.")
 
@@ -149,9 +156,20 @@ async def change_password(
 
 @router.post("/2fa/setup", response_model=TotpSetupResponse, summary="Initialiser la double authentification TOTP")
 async def setup_totp(
+    payload: TotpSetupRequest,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> TotpSetupResponse:
+    if current_user.totp_enabled:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="La double authentification est déjà activée. Désactivez-la d'abord avec votre mot de passe et un code TOTP.",
+        )
+    if not verify_password(payload.current_password, current_user.password_hash):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Mot de passe actuel incorrect.",
+        )
     secret = generate_totp_secret()
     current_user.totp_secret = secret
     current_user.totp_enabled = False
@@ -169,6 +187,11 @@ async def enable_totp(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> MessageResponse:
+    if current_user.totp_enabled:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="La double authentification est déjà activée.",
+        )
     if not current_user.totp_secret or not verify_totp_code(current_user.totp_secret, payload.code):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Code TOTP invalide.")
     current_user.totp_enabled = True
@@ -186,13 +209,15 @@ async def enable_totp(
 
 @router.post("/2fa/disable", response_model=MessageResponse, summary="Désactiver la double authentification TOTP")
 async def disable_totp(
-    payload: TotpVerifyRequest,
+    payload: TotpDisableRequest,
     request: Request,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> MessageResponse:
     if not current_user.totp_enabled or not current_user.totp_secret:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="2FA non activée.")
+    if not verify_password(payload.current_password, current_user.password_hash):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Mot de passe actuel incorrect.")
     if not verify_totp_code(current_user.totp_secret, payload.code):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Code TOTP invalide.")
     current_user.totp_enabled = False
@@ -207,4 +232,3 @@ async def disable_totp(
     )
     await db.commit()
     return MessageResponse(message="Double authentification désactivée.")
-
