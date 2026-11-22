@@ -1,4 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_current_user, get_optional_user
@@ -17,6 +18,7 @@ from app.models.user import User
 from app.schemas.auth import (
     ChangePasswordRequest,
     LoginRequest,
+    MeUpdateRequest,
     RefreshRequest,
     TokenResponse,
     TotpDisableRequest,
@@ -119,6 +121,47 @@ async def logout(
 
 @router.get("/me", response_model=UserOut, summary="Profil de l'utilisateur connecté")
 async def get_me(current_user: User = Depends(get_current_user)) -> UserOut:
+    return UserOut.model_validate(current_user)
+
+
+@router.patch("/me", response_model=UserOut, summary="Modifier ses informations personnelles")
+async def update_me(
+    payload: MeUpdateRequest,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> UserOut:
+    changes: dict[str, str | None] = {}
+    if payload.full_name is not None:
+        current_user.full_name = payload.full_name.strip()
+        changes["full_name"] = current_user.full_name
+    if payload.email is not None:
+        new_email = payload.email.strip().lower()
+        if new_email != current_user.email:
+            dup = await db.execute(select(User).where(User.email == new_email, User.id != current_user.id))
+            if dup.scalar_one_or_none() is not None:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="Un autre compte utilise déjà cet e-mail.",
+                )
+            current_user.email = new_email
+            changes["email"] = new_email
+    if payload.phone is not None:
+        current_user.phone = payload.phone.strip() or None
+        changes["phone"] = current_user.phone
+
+    if changes:
+        await record_audit_log(
+            db,
+            action="auth.profile_updated",
+            resource_type="user",
+            resource_id=current_user.id,
+            actor=current_user,
+            ip_address=client_ip(request),
+            details=changes,
+        )
+        await db.commit()
+        await db.refresh(current_user)
     return UserOut.model_validate(current_user)
 
 

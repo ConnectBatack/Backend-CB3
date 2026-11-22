@@ -17,8 +17,8 @@ API REST complète de la plateforme de dons et de gestion pour le village de Bat
   - Justificatifs et documents **privés par défaut** (`is_public=false`).
   - Contenus CMS et projets validés en texte brut (sans balises HTML).
   - Montants collectés et nombre de contributeurs calculés dynamiquement à partir des seules écritures validées du registre.
-- **Dons Stripe & Suivi des projets (RGPD)** :
-  - Appels Stripe non-bloquants, pas de création prématurée de `Customer`, gestion des remboursements (`charge.refunded`), litiges (`charge.dispute.created`), renouvellements (`invoice.paid`) et frais Stripe inscrits au registre.
+- **Dons par dépôt sur compte & Suivi des projets (RGPD)** :
+  - Consultation des coordonnées et comptes de dépôt du COVIDEBA (`/api/v1/donations/accounts`) puis soumission du reçu de dépôt/virement par le donateur (`/api/v1/donations/submit-receipt`), enregistré comme justificatif privé en attente de contresignature du trésorier.
   - Dons manuels possibles sans adresse e-mail (téléphone facultatif), libellés publics anonymisés.
   - Suivi de projet par e-mail (SMTP) avec double opt-in et désinscription (aucun jeton exposé en HTTP).
 - **Registre financier chaîné SHA-256 & Transferts** :
@@ -44,4 +44,28 @@ uvicorn app.main:app --reload --port 8001
 ```bash
 make lint
 make test
+```
+
+## Déploiement CI/CD (GitHub Actions → VPS)
+
+Le workflow [`.github/workflows/ci-cd.yml`](.github/workflows/ci-cd.yml) :
+1. Sur chaque `push` ou `pull_request` vers `main` : exécute `ruff`, `pytest`, vérifie les migrations Alembic et teste le build Docker (`ci`).
+2. Sur chaque `push` sur `main` (ou déclenchement manuel `workflow_dispatch`) après succès de `ci` : déploie automatiquement sur le VPS via SSH (`docker compose up -d db redis --wait && docker compose build api && docker compose up -d api`, avec migrations Alembic automatiques au démarrage et vérification de `/api/v1/health`).
+
+### Secrets GitHub à configurer (`Settings → Secrets and variables → Actions`)
+- `VPS_HOST` : adresse IP ou nom de domaine du VPS
+- `VPS_USER` : utilisateur SSH ayant accès à Docker (`usermod -aG docker <user>`)
+- `VPS_SSH_KEY` : clé privée SSH dédiée au déploiement
+- `VPS_PORT` *(optionnel, défaut `22`)* : port SSH
+- `VPS_DEPLOY_DIR` *(optionnel, défaut `/opt/batack-backend`)* : dossier cible sur le VPS
+- `VPS_API_PORT` *(optionnel, défaut `8001`)* : port local exposé par le service `api`
+
+### Préparation unique sur le VPS
+```bash
+sudo mkdir -p /opt/batack-backend
+sudo chown -R "$USER":"$USER" /opt/batack-backend
+git clone https://github.com/ConnectBatack/Backend-CB3.git /opt/batack-backend
+cd /opt/batack-backend
+cp .env.example .env
+# Renseigner SECRET_KEY, POSTGRES_PASSWORD, REDIS_PASSWORD, APP_ENV=production, etc.
 ```

@@ -37,7 +37,6 @@ class Settings(BaseSettings):
     # Application
     APP_NAME: str = "Batack API"
     TOTP_ISSUER_NAME: str = "Batack"
-    STRIPE_PRODUCT_NAME: str = "Don Batack"
     APP_ENV: Literal["development", "staging", "production", "test"] = "production"
     DEBUG: bool = False
     API_V1_PREFIX: str = "/api/v1"
@@ -75,15 +74,6 @@ class Settings(BaseSettings):
     FRONTEND_IMAGES_DIR: str = ""
     FRONTEND_I18N_DIR: str = ""
 
-    # Stripe / Donations
-    STRIPE_SECRET_KEY: str = ""
-    STRIPE_WEBHOOK_SECRET: str = ""
-    PAIEMENT_REEL_AUTORISE: str = "non"
-    DON_MENSUEL_ACTIF: bool = False
-    DON_MONTANT_MIN_EUR: int = 5
-    DON_MONTANT_MAX_EUR: int = 5000
-    PENDING_DONATION_RETENTION_DAYS: int = 30
-
     # SMTP (e-mails de confirmation double opt-in)
     SMTP_HOST: str = ""
     SMTP_PORT: int = 587
@@ -97,6 +87,9 @@ class Settings(BaseSettings):
     ADMIN_DEFAULT_EMAIL: str = "admin@batack.org"
     ADMIN_DEFAULT_PASSWORD: str = ""
     ADMIN_DEFAULT_NAME: str = "Administrateur ENSPY"
+
+    # Traduction automatique (Google Translate API v2 si clé fournie, sinon endpoint public)
+    GOOGLE_TRANSLATE_API_KEY: str = ""
 
     @field_validator("SECRET_KEY")
     @classmethod

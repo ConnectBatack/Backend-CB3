@@ -121,3 +121,28 @@ class ProjectSubscription(Base):
     unsubscribed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow)
 
+
+class OrganizationSettings(Base):
+    """Paramètres modifiables du COVIDEBA (contact public et numéros de compte de don)."""
+
+    __tablename__ = "organization_settings"
+
+    key: Mapped[str] = mapped_column(String(32), primary_key=True, default="default")
+    covideba_email: Mapped[str] = mapped_column(String(254), nullable=False)
+    covideba_phone: Mapped[str] = mapped_column(String(64), nullable=False)
+    bank_holder: Mapped[str] = mapped_column(String(160), nullable=False)
+    bank_name: Mapped[str] = mapped_column(String(160), nullable=False)
+    bank_account: Mapped[str] = mapped_column(String(120), nullable=False)
+    mobile_money_mtn: Mapped[str] = mapped_column(String(64), nullable=False)
+    mobile_money_orange: Mapped[str] = mapped_column(String(64), nullable=False)
+    postal_address: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    other_info: Mapped[str | None] = mapped_column(String(1000), nullable=True)
+    updated_by_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utcnow, onupdate=utcnow
+    )
+
+

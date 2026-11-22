@@ -1,0 +1,139 @@
+name: CI/CD Backend (Batack API)
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-backend-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  ci:
+    name: Lint, Tests, Migrations & Docker Build
+    runs-on: ubuntu-latest
+    env:
+      APP_ENV: test
+      SECRET_KEY: ci_test_secret_key_for_github_actions_min_48_chars_2026
+      SESSION_COOKIE_SECURE: "false"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Ruff lint
+        run: ruff check app tests alembic scripts
+
+      - name: Run pytest suite
+        run: pytest -v
+
+      - name: Verify Alembic migrations on clean SQLite DB
+        run: |
+          DATABASE_URL="sqlite+aiosqlite:///./ci_migrations.db" alembic upgrade head
+          rm -f ci_migrations.db
+
+      - name: Verify Docker image build
+        run: docker build -t batack-api:ci .
+
+  deploy:
+    name: Deploy to VPS
+    needs: ci
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check required SSH secrets
+        run: |
+          if [ -z "${{ secrets.VPS_HOST }}" ] || [ -z "${{ secrets.VPS_USER }}" ] || [ -z "${{ secrets.VPS_SSH_KEY }}" ]; then
+            echo "::error::Secrets manquants : VPS_HOST, VPS_USER et VPS_SSH_KEY doivent être configurés dans GitHub Actions."
+            exit 1
+          fi
+
+      - name: Configure SSH client
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "${{ secrets.VPS_SSH_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          VPS_PORT="${{ secrets.VPS_PORT }}"
+          VPS_PORT="${VPS_PORT:-22}"
+          ssh-keyscan -p "$VPS_PORT" -H "${{ secrets.VPS_HOST }}" >> ~/.ssh/known_hosts 2>/dev/null || true
+
+      - name: Deploy backend via Docker Compose on VPS
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_USER: ${{ secrets.VPS_USER }}
+          VPS_PORT: ${{ secrets.VPS_PORT }}
+          VPS_DEPLOY_DIR: ${{ secrets.VPS_DEPLOY_DIR }}
+          VPS_API_PORT: ${{ secrets.VPS_API_PORT }}
+          REPO_URL: https://github.com/${{ github.repository }}.git
+        run: |
+          PORT="${VPS_PORT:-22}"
+          DEPLOY_DIR="${VPS_DEPLOY_DIR:-/opt/batack-backend}"
+          API_PORT="${VPS_API_PORT:-8001}"
+
+          ssh -i ~/.ssh/deploy_key -p "$PORT" -o StrictHostKeyChecking=accept-new "${VPS_USER}@${VPS_HOST}" bash -s -- "$DEPLOY_DIR" "$REPO_URL" "$API_PORT" <<'EOF'
+          set -euo pipefail
+          DEPLOY_DIR="$1"
+          REPO_URL="$2"
+          API_PORT="$3"
+
+          if [ ! -d "$DEPLOY_DIR/.git" ]; then
+            mkdir -p "$(dirname "$DEPLOY_DIR")"
+            git clone --branch main "$REPO_URL" "$DEPLOY_DIR"
+          fi
+
+          cd "$DEPLOY_DIR"
+          git fetch origin main
+          git checkout main
+          git reset --hard origin/main
+
+          if [ ! -f .env ]; then
+            echo "ERREUR : le fichier $DEPLOY_DIR/.env est absent sur le VPS."
+            echo "Copiez .env.example vers .env et renseignez vos secrets de production avant le prochain déploiement."
+            exit 1
+          fi
+
+          mkdir -p storage/photos storage/logos storage/justificatifs storage/documents storage/autres
+
+          docker compose up -d db redis --wait
+          docker compose build api
+          docker compose up -d api
+
+          echo "Vérification de la santé de l'API sur http://127.0.0.1:${API_PORT}/api/v1/health..."
+          for i in $(seq 1 20); do
+            if curl -fsS "http://127.0.0.1:${API_PORT}/api/v1/health" > /dev/null; then
+              echo "Déploiement réussi !"
+              docker compose ps
+              docker image prune -f > /dev/null 2>&1 || true
+              exit 0
+            fi
+            sleep 3
+          done
+
+          echo "ERREUR : l'API n'a pas répondu à /api/v1/health après 60s."
+          docker compose logs --tail=80 api
+          exit 1
+          EOF
+
+      - name: Cleanup SSH key
+        if: always()
+        run: rm -f ~/.ssh/deploy_key
+

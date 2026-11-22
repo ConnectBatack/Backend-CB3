@@ -23,6 +23,7 @@ class UserOut(BaseModel):
     id: str
     email: EmailStr
     full_name: str
+    phone: str | None = None
     role: UserRole
     is_active: bool
     must_change_password: bool
@@ -50,9 +51,17 @@ class UserCreate(BaseModel):
 
 class UserUpdate(BaseModel):
     full_name: str | None = Field(default=None, min_length=2, max_length=120)
+    email: EmailStr | None = None
+    phone: str | None = Field(default=None, max_length=32)
     role: UserRole | None = None
     is_active: bool | None = None
     must_change_password: bool | None = None
+
+
+class MeUpdateRequest(BaseModel):
+    full_name: str | None = Field(default=None, min_length=2, max_length=120)
+    email: EmailStr | None = None
+    phone: str | None = Field(default=None, max_length=32)
 
 
 class AdminResetPasswordRequest(BaseModel):

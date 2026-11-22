@@ -13,11 +13,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import PARITE_FCFA
 from app.models.enums import (
     Currency,
+    DonationStatus,
     LedgerDirection,
     LedgerEntryType,
     LedgerStatus,
 )
-from app.models.finance import LedgerEntry
+from app.models.finance import Donation, LedgerEntry
 from app.models.user import User
 from app.services.audit import record_audit_log
 
@@ -349,6 +350,14 @@ async def validate_ledger_entry(
             actor=actor,
         )
 
+        # Si l'écriture est liée à un don (reçu soumis ou don manuel), le marquer PAYÉ
+        if entry.donation_id:
+            don_res = await db.execute(select(Donation).where(Donation.id == entry.donation_id))
+            donation = don_res.scalar_one_or_none()
+            if donation is not None:
+                donation.status = DonationStatus.PAID
+                donation.paid_at = datetime.now(UTC)
+
         await record_audit_log(
             db,
             action="registry.entry_validated",
@@ -405,6 +414,12 @@ async def reject_ledger_entry(
             rejection_reason=reason,
             actor=actor,
         )
+
+        if entry.donation_id:
+            don_res = await db.execute(select(Donation).where(Donation.id == entry.donation_id))
+            donation = don_res.scalar_one_or_none()
+            if donation is not None:
+                donation.status = DonationStatus.FAILED
 
         await record_audit_log(
             db,

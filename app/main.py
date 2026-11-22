@@ -31,8 +31,8 @@ def create_app() -> FastAPI:
         version="1.0.0",
         description=(
             "API REST de la plateforme de gestion et de dons pour Batack : "
-            "dons Stripe, transparence, registre comptable chaîné, rôles COVIDEBA/ENSPY/UMONS, "
-            "AHP, planification MILP v5_5 et gestion locale des médias."
+            "dons par dépôt/virement avec soumission de reçu, transparence, registre comptable chaîné, "
+            "rôles COVIDEBA/ENSPY/UMONS, AHP, planification MILP v5_5 et gestion locale des médias."
         ),
         docs_url=None if is_prod else "/docs",
         redoc_url=None if is_prod else "/redoc",

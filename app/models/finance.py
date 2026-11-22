@@ -72,6 +72,7 @@ class Donation(Base):
     donor_last_name: Mapped[str] = mapped_column(String(100), nullable=False)
     donor_email: Mapped[str | None] = mapped_column(String(254), nullable=True, index=True)
     donor_phone: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    donor_country: Mapped[str | None] = mapped_column(String(16), nullable=True)
     tax_receipt_requested: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     terms_accepted: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     language: Mapped[str] = mapped_column(String(8), nullable=False, default="fr")
@@ -81,6 +82,9 @@ class Donation(Base):
     stripe_payment_intent_id: Mapped[str | None] = mapped_column(String(120), nullable=True)
     stripe_subscription_id: Mapped[str | None] = mapped_column(String(120), nullable=True, index=True)
     receipt_reference: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    receipt_media_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("media_assets.id", ondelete="SET NULL"), nullable=True
+    )
 
     recorded_by_id: Mapped[str | None] = mapped_column(
         String(36), ForeignKey("users.id", ondelete="SET NULL"), nullable=True

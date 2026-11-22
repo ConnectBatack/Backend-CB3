@@ -27,9 +27,6 @@ argon2-cffi-bindings==26.2.0
 PyJWT==2.15.1
 PyOTP==2.11.2
 
-# Payments (Stripe)
-stripe==17.0.0
-
 # Optimization Solver (HiGHS MILP) & Math
 highspy==1.16.0
 numpy==2.5.4

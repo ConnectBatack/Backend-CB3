@@ -17,6 +17,7 @@ from app.services.ledger_service import (
     compute_registry_summary,
     resolve_effective_operations,
 )
+from app.services.settings_service import get_effective_organization_settings
 
 router = APIRouter(prefix="/public", tags=["Vitrine publique"])
 
@@ -24,12 +25,13 @@ router = APIRouter(prefix="/public", tags=["Vitrine publique"])
 def _public_safe_label(entry: LedgerEntry) -> str:
     """Garantit qu'aucune donnée personnelle (nom de donateur) n'apparaît dans la vitrine publique."""
     if entry.donation_id is not None:
-        return "Don en ligne (Stripe)" if entry.account == "Fonds chez l'institution agréée" else "Don enregistré"
+        return "Don vérifié"
     return entry.label
 
 
 @router.get("/home", summary="Données complètes de la page d'accueil")
 async def get_public_home(db: AsyncSession = Depends(get_db)) -> dict:
+    org = await get_effective_organization_settings(db)
     proj_res = await db.execute(
         select(Project)
         .where(Project.status != ProjectStatus.ARCHIVED)
@@ -55,6 +57,19 @@ async def get_public_home(db: AsyncSession = Depends(get_db)) -> dict:
         "featured_need": featured_need,
         "projects": projects,
         "contents": contents,
+        "contact": {
+            "email": org.covideba_email,
+            "phone": org.covideba_phone,
+            "postal_address": org.postal_address,
+            "other_info": org.other_info,
+        },
+        "payment_accounts": {
+            "bank_holder": org.bank_holder,
+            "bank_name": org.bank_name,
+            "bank_account": org.bank_account,
+            "mobile_money_mtn": org.mobile_money_mtn,
+            "mobile_money_orange": org.mobile_money_orange,
+        },
     }
 
 

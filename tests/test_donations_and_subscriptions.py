@@ -1,13 +1,95 @@
-import json
 import re
-from types import SimpleNamespace
 
 import pytest
 from httpx import AsyncClient
 
-from app.core.config import get_settings
 from app.services.email_service import email_service
 from tests.conftest import login_as
+
+
+@pytest.mark.asyncio
+async def test_payment_accounts_and_receipt_submission_flow(client: AsyncClient, staff_users):
+    admin_h = await login_as(client, "admin@batack.org", "AdminPass2026!")
+    membre_h = await login_as(client, "membre@batack.org", "MembrePass2026!")
+    tres_h = await login_as(client, "tresorier@batack.org", "TresorierPass2026!")
+
+    await client.post(
+        "/api/v1/projects",
+        headers=membre_h,
+        json={"slug": "dispensaire", "title": {"fr": "Dispensaire"}, "target_amount_eur": "12000.00"},
+    )
+
+    # Configuration préalable depuis l'interface admin
+    await client.put(
+        "/api/v1/settings/organization",
+        headers=admin_h,
+        json={
+            "covideba_email": "tresorerie@covideba.org",
+            "covideba_phone": "+237 699 11 22 33",
+            "bank_holder": "COVIDEBA Batack",
+            "bank_name": "Afriland First Bank",
+            "bank_account": "CM21 10005 00001 11223344556 77",
+            "mobile_money_mtn": "+237 670 11 22 33",
+            "mobile_money_orange": "+237 690 11 22 33",
+        },
+    )
+
+    # Lecture des comptes de dépôt du COVIDEBA
+    acc = await client.get("/api/v1/donations/accounts")
+    assert acc.status_code == 200
+    assert acc.json()["covideba_email"] == "tresorerie@covideba.org"
+    assert acc.json()["bank_account"] == "CM21 10005 00001 11223344556 77"
+
+    # Soumission d'un reçu de dépôt par un donateur (sans compte)
+    pdf_bytes = b"%PDF-1.4\n1 0 obj\n<<>>\nendobj\ntrailer\n<<>>\n%%EOF"
+    sub = await client.post(
+        "/api/v1/donations/submit-receipt",
+        data={
+            "montant_fcfa": "25000",
+            "moyen": "virement",
+            "receipt_reference": "VIR-2026-8841",
+            "nom": "Dupont",
+            "prenom": "Jean",
+            "email": "jean@example.org",
+            "pays": "BE",
+            "attestation": "true",
+            "conditions": "true",
+            "langue": "fr",
+            "projet": "dispensaire",
+        },
+        files={"receipt_file": ("recu-virement.pdf", pdf_bytes, "application/pdf")},
+    )
+    assert sub.status_code == 201, sub.text
+    body = sub.json()
+    assert body["status"] == "pending"
+    assert body["amount_fcfa"] == 25000
+    assert body["receipt_reference"] == "VIR-2026-8841"
+
+    # Le justificatif soumis est privé par défaut
+    assert (await client.get(f"/api/v1/media/files/{body['receipt_media_id']}")).status_code == 401
+    assert (
+        await client.get(f"/api/v1/media/files/{body['receipt_media_id']}", headers=tres_h)
+    ).status_code == 200
+
+    # Avant validation du trésorier, le don reste PENDING et le montant public du projet est à 0.00
+    don_before = await client.get(f"/api/v1/donations/{body['donation_id']}", headers=tres_h)
+    assert don_before.json()["status"] == "pending"
+    proj_before = await client.get("/api/v1/projects/dispensaire")
+    assert proj_before.json()["collected_amount_eur"] == "0.00"
+
+    # Le nom du donateur n'apparaît pas dans le libellé du registre
+    entries = (await client.get("/api/v1/registry/entries", headers=tres_h)).json()["items"]
+    assert "Dupont" not in entries[0]["label"]
+
+    # Validation par le trésorier -> passe le don à PAID et met à jour les montants publics
+    val = await client.post(f"/api/v1/registry/entries/{entries[0]['id']}/validate", headers=tres_h)
+    assert val.status_code == 200
+
+    don_after = await client.get(f"/api/v1/donations/{body['donation_id']}", headers=tres_h)
+    assert don_after.json()["status"] == "paid"
+    proj_after = await client.get("/api/v1/projects/dispensaire")
+    assert float(proj_after.json()["collected_amount_eur"]) > 0
+    assert proj_after.json()["contributors_count"] == 1
 
 
 @pytest.mark.asyncio
@@ -22,7 +104,6 @@ async def test_manual_donation_without_email_anonymized_and_validated_before_pub
     )
     assert p.status_code == 201
 
-    # Don manuel en espèces SANS adresse e-mail (téléphone facultatif)
     ok = await client.post(
         "/api/v1/donations/manual",
         headers=tres_h,
@@ -39,18 +120,15 @@ async def test_manual_donation_without_email_anonymized_and_validated_before_pub
     assert ok.status_code == 201
     assert ok.json()["donor_email"] is None
     assert ok.json()["donor_phone"] == "+237699000000"
+    assert ok.json()["status"] == "pending"
 
-    # Avant contresignature, le montant public collecté reste à 0.00 EUR
     proj_before = await client.get("/api/v1/projects/ecole")
     assert proj_before.json()["collected_amount_eur"] == "0.00"
-    assert proj_before.json()["contributors_count"] == 0
 
-    # Le nom du donateur n'apparaît ni dans le libellé du registre ni sur /public/transparence
     entries = (await client.get("/api/v1/registry/entries", headers=tres_h)).json()["items"]
     entry_id = entries[0]["id"]
     assert "Kamga" not in entries[0]["label"]
 
-    # Contresignature par le membre -> le montant public passe à 100.00 EUR
     val = await client.post(f"/api/v1/registry/entries/{entry_id}/validate", headers=membre_h)
     assert val.status_code == 200
 
@@ -84,110 +162,6 @@ async def test_manual_donation_without_email_anonymized_and_validated_before_pub
     assert rej.status_code == 200
     proj_still = await client.get("/api/v1/projects/ecole")
     assert proj_still.json()["collected_amount_eur"] == "100.00"
-
-
-@pytest.mark.asyncio
-async def test_stripe_checkout_fees_refund_and_idempotency(client: AsyncClient, staff_users, monkeypatch):
-    membre_h = await login_as(client, "membre@batack.org", "MembrePass2026!")
-    await client.post(
-        "/api/v1/projects",
-        headers=membre_h,
-        json={"slug": "batteries", "title": {"fr": "Batteries"}, "target_amount_eur": "3000.00"},
-    )
-
-    monkeypatch.setenv("STRIPE_SECRET_KEY", "sk_test_fake_12345")
-    monkeypatch.setenv("STRIPE_WEBHOOK_SECRET", "whsec_test_12345")
-    get_settings.cache_clear()
-
-    import stripe
-
-    # Vérifier qu'aucun Customer.create prématuré n'est appelé
-    def _forbid_customer_create(**kwargs):
-        raise AssertionError("Customer.create ne doit pas être appelé avant la finalisation du paiement")
-
-    monkeypatch.setattr(stripe.Customer, "create", _forbid_customer_create)
-    monkeypatch.setattr(
-        stripe.checkout.Session,
-        "create",
-        lambda **kwargs: SimpleNamespace(id="cs_test_1", url="https://checkout.stripe.com/pay/cs_test_1"),
-    )
-    monkeypatch.setattr(
-        stripe.PaymentIntent,
-        "retrieve",
-        lambda pi_id, expand=None: {"latest_charge": {"balance_transaction": {"fee": 175}}},
-    )
-
-    checkout = await client.post(
-        "/api/v1/donations/checkout",
-        json={
-            "montant": 50,
-            "frequence": "ponctuel",
-            "moyen": "bancontact",
-            "projet": "batteries",
-            "prenom": "Alice",
-            "nom": "Martin",
-            "email": "alice@example.org",
-            "attestation": True,
-            "conditions": True,
-            "langue": "fr",
-        },
-    )
-    assert checkout.status_code == 200
-    donation_id = checkout.json()["donation_id"]
-
-    paid_event = {
-        "id": "evt_test_001",
-        "type": "checkout.session.completed",
-        "data": {
-            "object": {
-                "id": "cs_test_1",
-                "payment_status": "paid",
-                "payment_intent": "pi_test_1",
-                "metadata": {"donation_id": donation_id},
-            }
-        },
-    }
-    monkeypatch.setattr(stripe.Webhook, "construct_event", lambda payload, sig, secret: paid_event)
-
-    wh1 = await client.post(
-        "/api/v1/webhooks/stripe",
-        content=json.dumps(paid_event),
-        headers={"stripe-signature": "t=1,v1=sig"},
-    )
-    assert wh1.status_code == 200
-
-    # Idempotence
-    wh2 = await client.post(
-        "/api/v1/webhooks/stripe",
-        content=json.dumps(paid_event),
-        headers={"stripe-signature": "t=1,v1=sig"},
-    )
-    assert wh2.status_code == 200
-    assert wh2.json()["duplicate"] is True
-
-    # Frais Stripe (1.75 EUR) enregistrés en sortie dans le registre
-    summary = (await client.get("/api/v1/registry/summary", headers=membre_h)).json()
-    assert summary["total_validated_in_eur"] == "50.00"
-    assert summary["total_validated_out_eur"] == "1.75"
-    assert summary["available_balance_eur"] == "48.25"
-
-    # Remboursement Stripe -> écriture de sortie compensatoire
-    refund_event = {
-        "id": "evt_refund_001",
-        "type": "charge.refunded",
-        "data": {"object": {"payment_intent": "pi_test_1", "amount_refunded": 5000}},
-    }
-    monkeypatch.setattr(stripe.Webhook, "construct_event", lambda payload, sig, secret: refund_event)
-    wh_ref = await client.post(
-        "/api/v1/webhooks/stripe",
-        content=json.dumps(refund_event),
-        headers={"stripe-signature": "t=1,v1=sig"},
-    )
-    assert wh_ref.status_code == 200
-    don_after = (await client.get(f"/api/v1/donations/{donation_id}", headers=membre_h)).json()
-    assert don_after["status"] == "refunded"
-
-    get_settings.cache_clear()
 
 
 @pytest.mark.asyncio

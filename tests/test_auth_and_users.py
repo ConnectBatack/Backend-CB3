@@ -203,3 +203,94 @@ def test_production_startup_security_guards():
     )
     with pytest.raises(RuntimeError):
         s2.validate_startup_security()
+
+
+@pytest.mark.asyncio
+async def test_update_own_profile_and_admin_user_fields(client: AsyncClient, staff_users):
+    admin_h = await login_as(client, "admin@batack.org", "AdminPass2026!")
+    membre_h = await login_as(client, "membre@batack.org", "MembrePass2026!")
+
+    # Le membre modifie ses informations personnelles (nom, e-mail, téléphone)
+    upd = await client.patch(
+        "/api/v1/auth/me",
+        headers=membre_h,
+        json={
+            "full_name": "Membre Renommé",
+            "email": "membre.nouveau@batack.org",
+            "phone": "+237 6 77 88 99 00",
+        },
+    )
+    assert upd.status_code == 200
+    body = upd.json()
+    assert body["full_name"] == "Membre Renommé"
+    assert body["email"] == "membre.nouveau@batack.org"
+    assert body["phone"] == "+237 6 77 88 99 00"
+
+    # Conflit si on tente de prendre l'e-mail de l'admin
+    dup = await client.patch(
+        "/api/v1/auth/me",
+        headers=membre_h,
+        json={"email": "admin@batack.org"},
+    )
+    assert dup.status_code == 409
+
+    # L'admin peut aussi modifier le téléphone/email d'un utilisateur
+    membre_id = body["id"]
+    adm_upd = await client.patch(
+        f"/api/v1/users/{membre_id}",
+        headers=admin_h,
+        json={"phone": "+32 470 00 11 22", "email": "membre.admin@batack.org"},
+    )
+    assert adm_upd.status_code == 200
+    assert adm_upd.json()["phone"] == "+32 470 00 11 22"
+    assert adm_upd.json()["email"] == "membre.admin@batack.org"
+
+
+@pytest.mark.asyncio
+async def test_organization_settings_rbac_and_public_propagation(client: AsyncClient, staff_users):
+    admin_h = await login_as(client, "admin@batack.org", "AdminPass2026!")
+    membre_h = await login_as(client, "membre@batack.org", "MembrePass2026!")
+
+    # Un membre peut lire les paramètres de l'organisation, mais seul l'admin peut modifier
+    r_get = await client.get("/api/v1/settings/organization", headers=membre_h)
+    assert r_get.status_code == 200
+
+    r_forbid = await client.put(
+        "/api/v1/settings/organization",
+        headers=membre_h,
+        json={"covideba_phone": "+237 6 00 00 00 00"},
+    )
+    assert r_forbid.status_code == 403
+
+    r_ok = await client.put(
+        "/api/v1/settings/organization",
+        headers=admin_h,
+        json={
+            "covideba_email": "nouveau-contact@covideba.org",
+            "covideba_phone": "+237 6 91 23 45 67",
+            "bank_holder": "COVIDEBA Batack Trésorerie",
+            "bank_name": "Afriland First Bank",
+            "bank_account": "CM21 10005 00001 99999999999 42",
+            "mobile_money_mtn": "+237 6 70 11 22 33",
+            "mobile_money_orange": "+237 6 90 44 55 66",
+            "postal_address": "BP 124 Batack, Cameroun",
+            "other_info": "Permanence téléphonique lun-ven 9h-17h.",
+        },
+    )
+    assert r_ok.status_code == 200
+    updated = r_ok.json()
+    assert updated["covideba_email"] == "nouveau-contact@covideba.org"
+    assert updated["bank_account"] == "CM21 10005 00001 99999999999 42"
+    assert updated["postal_address"] == "BP 124 Batack, Cameroun"
+
+    # Propagation immédiate sur /donations/accounts et /public/home
+    acc = (await client.get("/api/v1/donations/accounts")).json()
+    assert acc["covideba_email"] == "nouveau-contact@covideba.org"
+    assert acc["covideba_phone"] == "+237 6 91 23 45 67"
+    assert acc["mobile_money_mtn"] == "+237 6 70 11 22 33"
+    assert acc["postal_address"] == "BP 124 Batack, Cameroun"
+
+    home = (await client.get("/api/v1/public/home")).json()
+    assert home["contact"]["email"] == "nouveau-contact@covideba.org"
+    assert home["payment_accounts"]["bank_name"] == "Afriland First Bank"
+

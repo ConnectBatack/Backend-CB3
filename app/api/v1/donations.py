@@ -1,46 +1,215 @@
-from datetime import UTC, date, datetime
+import re
+from datetime import date
 from decimal import Decimal
+from typing import Literal
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from fastapi import (
+    APIRouter,
+    Depends,
+    File,
+    Form,
+    HTTPException,
+    Query,
+    Request,
+    UploadFile,
+    status,
+)
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import ALL_STAFF_ROLES, TREASURY_ROLES, require_roles
+from app.core.config import SUPPORTED_LANGUAGES
 from app.core.database import get_db
 from app.core.rate_limit import client_ip, rate_limiter
+from app.core.storage import LocalStorageManager
 from app.models.content import Project
 from app.models.enums import (
+    Currency,
     DonationFrequency,
     DonationStatus,
     LedgerDirection,
     LedgerStatus,
+    MediaCategory,
     PaymentMethod,
 )
 from app.models.finance import Donation
+from app.models.media import MediaAsset
 from app.models.user import User
 from app.schemas.common import PaginatedResponse
 from app.schemas.finance import (
-    DonationCheckoutRequest,
-    DonationCheckoutResponse,
     DonationManualCreate,
     DonationOut,
+    DonationReceiptSubmitResponse,
+    PaymentAccountInfoOut,
 )
 from app.services.audit import record_audit_log
 from app.services.ledger_service import convert_currency, create_ledger_entry, ledger_write_lock
-from app.services.stripe_service import create_stripe_checkout_for_donation
+from app.services.settings_service import get_effective_organization_settings
 
-router = APIRouter(prefix="/donations", tags=["Dons & Paiements"])
+router = APIRouter(prefix="/donations", tags=["Dons & Dépôts avec reçu"])
+
+_RE_EMAIL = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
+DON_MONTANT_MIN_FCFA = 5000
+DON_MONTANT_MAX_FCFA = 655000000
 
 
-@router.post("/checkout", response_model=DonationCheckoutResponse, summary="Démarrer un don Stripe Checkout")
-async def create_checkout(
-    payload: DonationCheckoutRequest,
+@router.get("/accounts", response_model=PaymentAccountInfoOut, summary="Coordonnées et comptes de dépôt du COVIDEBA")
+async def get_payment_accounts(db: AsyncSession = Depends(get_db)) -> PaymentAccountInfoOut:
+    org = await get_effective_organization_settings(db)
+    return PaymentAccountInfoOut(**org.model_dump(exclude={"updated_at"}))
+
+
+@router.post(
+    "/submit-receipt",
+    response_model=DonationReceiptSubmitResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Soumettre un reçu de dépôt/virement pour confirmer un don",
+)
+async def submit_donation_receipt(
     request: Request,
+    montant_fcfa: int = Form(...),
+    moyen: Literal["virement", "mobile_money", "depot_bancaire"] = Form(...),
+    receipt_reference: str = Form(..., min_length=2, max_length=120),
+    nom: str = Form(..., min_length=1, max_length=100),
+    prenom: str = Form(default="", max_length=100),
+    email: str = Form(default="", max_length=254),
+    telephone: str = Form(default="", max_length=32),
+    pays: Literal["BE", "autre"] = Form(default="autre"),
+    attestation: bool = Form(default=False),
+    conditions: bool = Form(...),
+    langue: str = Form(default="fr"),
+    projet: str = Form(default="", max_length=64),
+    receipt_file: UploadFile = File(...),
     db: AsyncSession = Depends(get_db),
-) -> DonationCheckoutResponse:
-    await rate_limiter.check(f"checkout:{client_ip(request)}", max_requests=15, window_seconds=300)
-    donation, url = await create_stripe_checkout_for_donation(db, payload)
-    return DonationCheckoutResponse(donation_id=donation.id, checkout_url=url)
+) -> DonationReceiptSubmitResponse:
+    """
+    Reçoit la confirmation d'un don effectué directement sur le compte bancaire
+    ou Mobile Money du COVIDEBA : enregistre le reçu dans storage/justificatifs/
+    (privé) et crée une écriture `a_contresigner` en attente de vérification par le trésorier.
+    """
+    await rate_limiter.check(f"submit_receipt:{client_ip(request)}", max_requests=12, window_seconds=300)
+
+    if conditions is not True:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Les conditions doivent être acceptées.")
+    if langue not in SUPPORTED_LANGUAGES:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Langue non supportée.")
+    if montant_fcfa < DON_MONTANT_MIN_FCFA or montant_fcfa > DON_MONTANT_MAX_FCFA:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Le montant doit être compris entre {DON_MONTANT_MIN_FCFA} et {DON_MONTANT_MAX_FCFA} FCFA.",
+        )
+
+    cleaned_email = email.strip().lower()
+    cleaned_phone = telephone.strip()
+    if cleaned_email and not _RE_EMAIL.match(cleaned_email):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Adresse e-mail invalide.")
+    if not cleaned_email and not cleaned_phone:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Indiquez une adresse e-mail ou un numéro de téléphone.",
+        )
+    if attestation and pays != "BE":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="L'attestation fiscale est réservée aux donateurs résidant en Belgique.",
+        )
+
+    project: Project | None = None
+    if projet.strip():
+        p_res = await db.execute(select(Project).where(Project.slug == projet.strip()))
+        project = p_res.scalar_one_or_none()
+        if project is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Projet inconnu.")
+
+    # Enregistrement sécurisé du reçu dans storage/justificatifs/ (privé par défaut)
+    storage = LocalStorageManager()
+    stored = await storage.save_upload(receipt_file, category=MediaCategory.JUSTIFICATIF)
+
+    asset = MediaAsset(
+        category=MediaCategory.JUSTIFICATIF,
+        filename=stored.filename,
+        original_filename=stored.original_filename,
+        storage_path=stored.relative_path,
+        mime_type=stored.mime_type,
+        size_bytes=stored.size_bytes,
+        sha256=stored.sha256,
+        width=stored.width,
+        height=stored.height,
+        alt_texts={},
+        captions={},
+        is_public=False,
+    )
+    db.add(asset)
+    await db.flush()
+
+    eur_equiv, fcfa_int = convert_currency(Decimal(montant_fcfa), Currency.FCFA)
+    method = PaymentMethod(moyen)
+    ref_clean = receipt_reference.strip()
+
+    donation = Donation(
+        project_id=project.id if project else None,
+        amount_eur=eur_equiv,
+        original_amount=Decimal(fcfa_int).quantize(Decimal("0.01")),
+        currency=Currency.FCFA,
+        frequency=DonationFrequency.PONCTUEL,
+        payment_method=method,
+        status=DonationStatus.PENDING,
+        donor_first_name=prenom.strip(),
+        donor_last_name=nom.strip(),
+        donor_email=cleaned_email or None,
+        donor_phone=cleaned_phone or None,
+        donor_country=pays,
+        tax_receipt_requested=attestation and pays == "BE",
+        terms_accepted=True,
+        language=langue,
+        receipt_reference=ref_clean,
+        receipt_media_id=asset.id,
+    )
+    db.add(donation)
+    await db.flush()
+
+    account_name = "Mobile Money" if method == PaymentMethod.MOBILE_MONEY else "Banque du COVIDEBA"
+    method_labels = {
+        PaymentMethod.VIREMENT: "Virement bancaire donateur (reçu soumis)",
+        PaymentMethod.DEPOT_BANCAIRE: "Dépôt bancaire donateur (reçu soumis)",
+        PaymentMethod.MOBILE_MONEY: "Dépôt Mobile Money donateur (reçu soumis)",
+    }
+
+    async with ledger_write_lock(db):
+        await create_ledger_entry(
+            db,
+            entry_date=date.today(),
+            label=method_labels.get(method, "Dépôt donateur (reçu soumis)"),
+            account=account_name,
+            direction=LedgerDirection.ENTREE,
+            amount=Decimal(fcfa_int),
+            currency=Currency.FCFA,
+            initial_status=LedgerStatus.A_CONTRESIGNER,
+            project_id=project.id if project else None,
+            donation_id=donation.id,
+            justificatif_media_id=asset.id,
+            receipt_number=ref_clean,
+            ip_address=client_ip(request),
+        )
+        await record_audit_log(
+            db,
+            action="donations.receipt_submitted",
+            resource_type="donation",
+            resource_id=donation.id,
+            ip_address=client_ip(request),
+            details={"amount_fcfa": fcfa_int, "method": method.value, "receipt_ref": ref_clean},
+        )
+        await db.commit()
+
+    return DonationReceiptSubmitResponse(
+        donation_id=donation.id,
+        status=DonationStatus.PENDING,
+        receipt_reference=ref_clean,
+        receipt_media_id=asset.id,
+        amount_fcfa=fcfa_int,
+        amount_eur=eur_equiv,
+        message="Reçu enregistré. Votre don sera confirmé après vérification par le trésorier du COVIDEBA.",
+    )
 
 
 @router.post(
@@ -63,7 +232,6 @@ async def record_manual_donation(
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Projet introuvable.")
 
     eur_equiv, _ = convert_currency(payload.amount, payload.currency)
-    now = datetime.now(UTC)
     method = PaymentMethod(payload.payment_method)
 
     donation = Donation(
@@ -73,7 +241,7 @@ async def record_manual_donation(
         currency=payload.currency,
         frequency=DonationFrequency.PONCTUEL,
         payment_method=method,
-        status=DonationStatus.PAID,
+        status=DonationStatus.PENDING,
         donor_first_name=payload.donor_first_name.strip(),
         donor_last_name=payload.donor_last_name.strip(),
         donor_email=payload.donor_email.lower().strip() if payload.donor_email else None,
@@ -83,12 +251,11 @@ async def record_manual_donation(
         language=payload.language,
         receipt_reference=payload.receipt_reference,
         recorded_by_id=current_user.id,
-        paid_at=now,
+        paid_at=None,
     )
     db.add(donation)
     await db.flush()
 
-    # Libellé générique sans nom de donateur ; montant public mis à jour uniquement après contresignature
     method_labels = {
         PaymentMethod.ESPECES: "Don manuel (espèces)",
         PaymentMethod.MOBILE_MONEY: "Don manuel (Mobile Money)",

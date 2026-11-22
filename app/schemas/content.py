@@ -24,7 +24,7 @@ def _assert_plain_text_structure(value: Any) -> Any:
 
 
 class ProjectBase(BaseModel):
-    slug: str = Field(min_length=2, max_length=64, pattern=r"^[a-z0-9-]+$")
+    slug: str | None = Field(default=None, min_length=2, max_length=64, pattern=r"^[a-z0-9-]+$")
     category: dict[str, str] = Field(default_factory=dict)
     title: dict[str, str]
     tagline: dict[str, str] = Field(default_factory=dict)
@@ -43,7 +43,9 @@ class ProjectBase(BaseModel):
 
 
 class ProjectCreate(ProjectBase):
-    pass
+    source_language: Literal["fr", "en", "es", "nl"] | None = None
+    auto_translate: bool = False
+    overwrite_translations: bool = True
 
 
 class ProjectUpdate(BaseModel):
@@ -57,6 +59,9 @@ class ProjectUpdate(BaseModel):
     is_featured_need: bool | None = None
     display_order: int | None = Field(default=None, ge=0)
     status: ProjectStatus | None = None
+    source_language: Literal["fr", "en", "es", "nl"] | None = None
+    auto_translate: bool = False
+    overwrite_translations: bool = True
 
     @field_validator("category", "title", "tagline", "description")
     @classmethod
@@ -64,6 +69,27 @@ class ProjectUpdate(BaseModel):
         if v is not None:
             return _assert_plain_text_structure(v)
         return v
+
+
+class ProjectTranslateRequest(BaseModel):
+    source_language: Literal["fr", "en", "es", "nl"] = "fr"
+    category: str = Field(default="", max_length=120)
+    title: str = Field(default="", max_length=200)
+    tagline: str = Field(default="", max_length=300)
+    description: str = Field(default="", max_length=4000)
+
+    @field_validator("category", "title", "tagline", "description")
+    @classmethod
+    def check_plain_text(cls, v: str) -> str:
+        return _assert_plain_text_structure(v)
+
+
+class ProjectTranslateResponse(BaseModel):
+    category: dict[str, str]
+    title: dict[str, str]
+    tagline: dict[str, str]
+    description: dict[str, str]
+    translated_with_google: bool = True
 
 
 class ProjectOut(BaseModel):

@@ -242,23 +242,26 @@ def main() -> int:
         r = client.get(f"{API}/public/transparence")
         record("GET", "/api/v1/public/transparence", r, (200,), "Vitrine transparence")
 
-        r = client.post(
-            f"{API}/donations/checkout",
-            json={
-                "montant": 50,
-                "frequence": "ponctuel",
-                "moyen": "carte",
-                "projet": proj_slug,
-                "nom": "Testeur",
-                "email": "donateur@example.org",
-                "conditions": True,
-                "langue": "fr",
-            },
-        )
-        record("POST", "/api/v1/donations/checkout", r, (200, 503), "Checkout Stripe")
+        r = client.get(f"{API}/donations/accounts")
+        record("GET", "/api/v1/donations/accounts", r, (200,), "Comptes de dépôt COVIDEBA")
 
-        r = client.post(f"{API}/webhooks/stripe", content=b"{}", headers={"stripe-signature": "invalid"})
-        record("POST", "/api/v1/webhooks/stripe", r, (400, 503), "Webhook Stripe")
+        r = client.post(
+            f"{API}/donations/submit-receipt",
+            data={
+                "montant_fcfa": "15000",
+                "moyen": "virement",
+                "receipt_reference": f"VIR-{suffix}",
+                "nom": f"Donateur_{suffix}",
+                "email": f"donateur_{suffix}@example.org",
+                "pays": "autre",
+                "attestation": "false",
+                "conditions": "true",
+                "langue": "fr",
+                "projet": proj_slug,
+            },
+            files={"receipt_file": ("recu.png", make_png_bytes(), "image/png")},
+        )
+        record("POST", "/api/v1/donations/submit-receipt", r, (201,), "Reçu soumis pour vérification")
 
         r = client.post(
             f"{API}/donations/manual",

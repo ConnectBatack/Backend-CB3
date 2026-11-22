@@ -117,6 +117,20 @@ async def update_user(
     if payload.full_name is not None:
         user.full_name = payload.full_name.strip()
         changes["full_name"] = user.full_name
+    if payload.email is not None:
+        new_email = payload.email.strip().lower()
+        if new_email != user.email:
+            dup = await db.execute(select(User).where(User.email == new_email, User.id != user.id))
+            if dup.scalar_one_or_none() is not None:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="Un autre compte utilise déjà cet e-mail.",
+                )
+            user.email = new_email
+            changes["email"] = new_email
+    if payload.phone is not None:
+        user.phone = payload.phone.strip() or None
+        changes["phone"] = user.phone
     if payload.role is not None:
         user.role = payload.role
         changes["role"] = payload.role.value

@@ -2,7 +2,7 @@ from datetime import date, datetime
 from decimal import Decimal
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
+from pydantic import BaseModel, ConfigDict, EmailStr, Field
 
 from app.models.enums import (
     Currency,
@@ -15,39 +15,49 @@ from app.models.enums import (
 )
 
 
-class DonationCheckoutRequest(BaseModel):
-    """Aligné avec frontend/src/lib/regles-don.js."""
+class PaymentAccountInfoOut(BaseModel):
+    """Coordonnées du COVIDEBA et numéros de compte pour effectuer un don direct."""
 
-    montant: int = Field(ge=5, le=5000)
-    frequence: DonationFrequency = DonationFrequency.PONCTUEL
-    moyen: Literal["bancontact", "carte"]
-    projet: str = Field(default="", max_length=64)
-    prenom: str = Field(default="", max_length=100)
-    nom: str = Field(min_length=1, max_length=100)
-    email: EmailStr
-    attestation: bool = False
-    conditions: bool
-    langue: Literal["fr", "en", "es", "nl"] = "fr"
-
-    @field_validator("nom")
-    @classmethod
-    def strip_nom(cls, v: str) -> str:
-        cleaned = v.strip()
-        if not cleaned:
-            raise ValueError("Le nom de famille est obligatoire.")
-        return cleaned
-
-    @field_validator("conditions")
-    @classmethod
-    def must_accept_conditions(cls, v: bool) -> bool:
-        if v is not True:
-            raise ValueError("Les conditions doivent être acceptées.")
-        return v
+    covideba_email: str
+    covideba_phone: str
+    bank_holder: str
+    bank_name: str
+    bank_account: str
+    mobile_money_mtn: str
+    mobile_money_orange: str
+    postal_address: str | None = None
+    other_info: str | None = None
+    parity_fcfa_per_eur: Decimal
 
 
-class DonationCheckoutResponse(BaseModel):
+class OrganizationSettingsOut(PaymentAccountInfoOut):
+    """Paramètres complets de l'organisation avec date de dernière modification."""
+
+    updated_at: datetime | None = None
+
+
+class OrganizationSettingsUpdate(BaseModel):
+    """Mise à jour des coordonnées publiques et des numéros de compte par l'administrateur."""
+
+    covideba_email: EmailStr | None = None
+    covideba_phone: str | None = Field(default=None, min_length=4, max_length=64)
+    bank_holder: str | None = Field(default=None, min_length=2, max_length=160)
+    bank_name: str | None = Field(default=None, min_length=2, max_length=160)
+    bank_account: str | None = Field(default=None, min_length=4, max_length=120)
+    mobile_money_mtn: str | None = Field(default=None, min_length=4, max_length=64)
+    mobile_money_orange: str | None = Field(default=None, min_length=4, max_length=64)
+    postal_address: str | None = Field(default=None, max_length=255)
+    other_info: str | None = Field(default=None, max_length=1000)
+
+
+class DonationReceiptSubmitResponse(BaseModel):
     donation_id: str
-    checkout_url: str
+    status: DonationStatus
+    receipt_reference: str
+    receipt_media_id: str
+    amount_fcfa: int
+    amount_eur: Decimal
+    message: str
 
 
 class DonationManualCreate(BaseModel):
@@ -81,10 +91,11 @@ class DonationOut(BaseModel):
     donor_last_name: str
     donor_email: EmailStr | None
     donor_phone: str | None
+    donor_country: str | None
     tax_receipt_requested: bool
     language: str
-    stripe_session_id: str | None
     receipt_reference: str | None
+    receipt_media_id: str | None
     paid_at: datetime | None
     created_at: datetime
 
@@ -204,4 +215,3 @@ class TransparencyOut(BaseModel):
     projects_count: int
     parity_fcfa_per_eur: Decimal
     recent_entries: list[PublicLedgerItemOut]
-

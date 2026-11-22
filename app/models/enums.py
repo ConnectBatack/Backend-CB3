@@ -1,14 +1,14 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class UserRole(str, Enum):
+class UserRole(StrEnum):
     ADMIN = "admin"
     TRESORIER = "tresorier"
     MEMBRE = "membre"
     ENCADRANT = "encadrant"
 
 
-class MediaCategory(str, Enum):
+class MediaCategory(StrEnum):
     PHOTO = "photo"
     LOGO = "logo"
     JUSTIFICATIF = "justificatif"
@@ -16,19 +16,19 @@ class MediaCategory(str, Enum):
     AUTRE = "autre"
 
 
-class ProjectStatus(str, Enum):
+class ProjectStatus(StrEnum):
     ACTIVE = "active"
     COMPLETED = "completed"
     ARCHIVED = "archived"
 
 
-class SubscriptionStatus(str, Enum):
+class SubscriptionStatus(StrEnum):
     PENDING = "pending"
     ACTIVE = "active"
     UNSUBSCRIBED = "unsubscribed"
 
 
-class DonationStatus(str, Enum):
+class DonationStatus(StrEnum):
     PENDING = "pending"
     PAID = "paid"
     FAILED = "failed"
@@ -37,30 +37,31 @@ class DonationStatus(str, Enum):
     DISPUTED = "disputed"
 
 
-class DonationFrequency(str, Enum):
+class DonationFrequency(StrEnum):
     PONCTUEL = "ponctuel"
     MENSUEL = "mensuel"
 
 
-class PaymentMethod(str, Enum):
+class PaymentMethod(StrEnum):
     CARTE = "carte"
     BANCONTACT = "bancontact"
     MOBILE_MONEY = "mobile_money"
     ESPECES = "especes"
     VIREMENT = "virement"
+    DEPOT_BANCAIRE = "depot_bancaire"
 
 
-class Currency(str, Enum):
+class Currency(StrEnum):
     EUR = "EUR"
     FCFA = "FCFA"
 
 
-class LedgerDirection(str, Enum):
+class LedgerDirection(StrEnum):
     ENTREE = "entree"
     SORTIE = "sortie"
 
 
-class LedgerStatus(str, Enum):
+class LedgerStatus(StrEnum):
     A_CONTRESIGNER = "a_contresigner"
     VALIDEE = "validee"
     REJETEE = "rejetee"
@@ -72,20 +73,14 @@ class LedgerEntryType(StrEnum):
     REJET = "rejet"
 
 
-class LedgerEntryType(str, Enum):
-    OPERATION = "operation"
-    VALIDATION = "validation"
-    REJET = "rejet"
-
-
-class TaskStatus(str, Enum):
+class TaskStatus(StrEnum):
     CANDIDATE = "candidate"
     PLANNED = "planned"
     IN_PROGRESS = "in_progress"
     COMPLETED = "completed"
 
 
-class PlanStatus(str, Enum):
+class PlanStatus(StrEnum):
     DRAFT = "draft"
     VALIDATED = "validated"
     ARCHIVED = "archived"

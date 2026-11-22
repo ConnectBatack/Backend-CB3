@@ -1,4 +1,4 @@
-from app.models.content import Project, ProjectSubscription, SiteContent
+from app.models.content import OrganizationSettings, Project, ProjectSubscription, SiteContent
 from app.models.finance import Donation, FundTransfer, LedgerEntry, StripeEvent
 from app.models.media import MediaAsset
 from app.models.planning import AhpSession, InvestmentPlan, ProjectTask, TaskPrecedence
@@ -11,6 +11,7 @@ __all__ = [
     "MediaAsset",
     "Project",
     "SiteContent",
+    "OrganizationSettings",
     "ProjectSubscription",
     "Donation",
     "StripeEvent",

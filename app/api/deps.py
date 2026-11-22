@@ -105,9 +105,11 @@ async def get_current_user(
     allowed_when_pwd_change_required = {
         f"{prefix}/auth/change-password",
         f"{prefix}/auth/logout",
-        f"{prefix}/auth/me",
     }
-    if user.must_change_password and request.url.path not in allowed_when_pwd_change_required:
+    is_allowed = request.url.path in allowed_when_pwd_change_required or (
+        request.url.path == f"{prefix}/auth/me" and request.method == "GET"
+    )
+    if user.must_change_password and not is_allowed:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Changement de mot de passe obligatoire avant d'accéder à cette ressource.",
