@@ -49,16 +49,27 @@ make test
 ## Déploiement CI/CD (GitHub Actions → VPS)
 
 Le workflow [`.github/workflows/ci-cd.yml`](.github/workflows/ci-cd.yml) :
-1. Sur chaque `push` ou `pull_request` vers `main` : exécute `ruff`, `pytest`, vérifie les migrations Alembic et teste le build Docker (`ci`).
-2. Sur chaque `push` sur `main` (ou déclenchement manuel `workflow_dispatch`) après succès de `ci` : déploie automatiquement sur le VPS via SSH (`docker compose up -d db redis --wait && docker compose build api && docker compose up -d api`, avec migrations Alembic automatiques au démarrage et vérification de `/api/v1/health`).
+1. Sur chaque `push` ou `pull_request` vers `main` : exécute `ruff`, `pytest`, vérifie les migrations Alembic et la syntaxe Nginx, puis compile l'image Docker sur GitHub (`ci`).
+2. Sur chaque `push` sur `main` (ou `workflow_dispatch`) après succès de `ci` : pousse l'image précompilée vers **GitHub Container Registry (`ghcr.io`)**, envoie uniquement `docker-compose.yml` et `nginx/` sur le VPS (aucun code source sur le serveur), puis démarre les conteneurs (`docker compose pull api nginx` + `docker compose up -d --no-build`).
+
+### Reverse proxy Nginx & HTTPS automatique (`nginx/`)
+- [`nginx/templates/default.conf.template`](nginx/templates/default.conf.template) : mode HTTP initial (port `80`, limite upload `12M`, `/.well-known/acme-challenge/`).
+- [`nginx/modes/https.conf.template`](nginx/modes/https.conf.template) et [`nginx/30-configure-ssl.sh`](nginx/30-configure-ssl.sh) : bascule automatiquement en HTTPS (`443` + redirection `301`) dès que le certificat Let's Encrypt existe dans `nginx/certs/live/${NGINX_SERVER_NAME}/`, y compris après les redéploiements CI/CD.
 
 ### Secrets GitHub à configurer (`Settings → Secrets and variables → Actions`)
 - `VPS_HOST` : adresse IP ou nom de domaine du VPS
 - `VPS_USER` : utilisateur SSH ayant accès à Docker (`usermod -aG docker <user>`)
 - `VPS_SSH_KEY` : clé privée SSH dédiée au déploiement
+- *(Le push/pull GHCR utilise automatiquement `secrets.GITHUB_TOKEN` fourni par GitHub Actions)*
 - `VPS_PORT` *(optionnel, défaut `22`)* : port SSH
 - `VPS_DEPLOY_DIR` *(optionnel, défaut `/opt/batack-backend`)* : dossier cible sur le VPS
-- `VPS_API_PORT` *(optionnel, défaut `8001`)* : port local exposé par le service `api`
+- `VPS_NGINX_PORT` *(optionnel, défaut `8082`)* : port local (`127.0.0.1`) exposé par `batack_nginx` pour le contrôle de santé
+
+### Étapes pour déployer sur le VPS (sans code source sur le VPS)
+1. **Sur le VPS (une seule fois)** : créer `/opt/batack-backend/.env` à partir de `.env.example` (avec `NGINX_HTTP_PORT=8085`, `NGINX_SERVER_NAME=batack.datapipe.duckdns.org`, `BACKEND_PUBLIC_URL=https://batack.datapipe.duckdns.org`).
+2. **Sur GitHub** : ajouter les 3 secrets `VPS_HOST`, `VPS_USER`, `VPS_SSH_KEY` dans le dépôt, puis `git push origin main`.
+3. **Sur le Nginx hôte du VPS** : ajouter un vhost `batack.datapipe.duckdns.org` pointant vers `http://127.0.0.1:8085` puis lancer `sudo certbot --nginx -d batack.datapipe.duckdns.org`.
+4. **Initialiser la base (premier démarrage)** : `cd /opt/batack-backend && docker compose run --rm api python -m scripts.seed_db`.
 
 ### Préparation unique sur le VPS
 ```bash

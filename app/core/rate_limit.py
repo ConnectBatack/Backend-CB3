@@ -1,4 +1,5 @@
 import asyncio
+import ipaddress
 import time
 from collections import defaultdict, deque
 
@@ -89,18 +90,36 @@ class SlidingWindowRateLimiter:
 rate_limiter = SlidingWindowRateLimiter()
 
 
+def _is_trusted_proxy(direct_ip: str, trusted: set[str]) -> bool:
+    if direct_ip in trusted:
+        return True
+    try:
+        addr = ipaddress.ip_address(direct_ip)
+    except ValueError:
+        return False
+    for entry in trusted:
+        if "/" not in entry:
+            continue
+        try:
+            if addr in ipaddress.ip_network(entry, strict=False):
+                return True
+        except ValueError:
+            continue
+    return False
+
+
 def client_ip(request: Request) -> str:
     """
     Extrait l'IP du client.
     N'accepte X-Forwarded-For que si TRUST_PROXY_HEADERS=true et que l'émetteur
-    direct est dans TRUSTED_PROXIES (empêche l'usurpation d'IP).
+    direct est dans TRUSTED_PROXIES (IP exacte ou sous-réseau CIDR).
     """
     settings = get_settings()
     direct_ip = request.client.host if request.client else "unknown"
     if not settings.TRUST_PROXY_HEADERS:
         return direct_ip
     trusted = settings.trusted_proxies_set
-    if trusted and direct_ip not in trusted:
+    if trusted and not _is_trusted_proxy(direct_ip, trusted):
         return direct_ip
     forwarded = request.headers.get("x-forwarded-for")
     if forwarded:

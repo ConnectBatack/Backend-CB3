@@ -12,5 +12,6 @@ storage/*/*
 !storage/*/.gitkeep
 .git/
 .github/
+nginx/
 tests/
 

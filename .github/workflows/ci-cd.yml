@@ -9,13 +9,17 @@ on:
       - main
   workflow_dispatch:
 
+permissions:
+  contents: read
+  packages: write
+
 concurrency:
   group: deploy-backend-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
   ci:
-    name: Lint, Tests, Migrations & Docker Build
+    name: Lint, Tests, Migrations & Docker Build/Push
     runs-on: ubuntu-latest
     env:
       APP_ENV: test
@@ -49,16 +53,58 @@ jobs:
           DATABASE_URL="sqlite+aiosqlite:///./ci_migrations.db" alembic upgrade head
           rm -f ci_migrations.db
 
-      - name: Verify Docker image build
-        run: docker build -t batack-api:ci .
+      - name: Verify Nginx config syntax
+        run: |
+          sh -n nginx/30-configure-ssl.sh
+          docker run --rm --add-host=api:127.0.0.1 -e NGINX_SERVER_NAME=_ \
+            -v "$PWD/nginx/templates:/etc/nginx/templates:ro" \
+            nginx:1.27-alpine sh -c '/docker-entrypoint.d/20-envsubst-on-templates.sh && nginx -t'
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry (GHCR)
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=sha,prefix=sha-
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push API image to GHCR
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: ${{ github.event_name != 'pull_request' && github.ref == 'refs/heads/main' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
 
   deploy:
-    name: Deploy to VPS
+    name: Pull & Deploy Containers to VPS
     needs: ci
     if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
 
     steps:
+      - name: Checkout deployment files only
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: |
+            docker-compose.yml
+            nginx
+
       - name: Check required SSH secrets
         run: |
           if [ -z "${{ secrets.VPS_HOST }}" ] || [ -z "${{ secrets.VPS_USER }}" ] || [ -z "${{ secrets.VPS_SSH_KEY }}" ]; then
@@ -76,50 +122,56 @@ jobs:
           VPS_PORT="${VPS_PORT:-22}"
           ssh-keyscan -p "$VPS_PORT" -H "${{ secrets.VPS_HOST }}" >> ~/.ssh/known_hosts 2>/dev/null || true
 
-      - name: Deploy backend via Docker Compose on VPS
+      - name: Copy Compose/Nginx config & run prebuilt containers on VPS
         env:
           VPS_HOST: ${{ secrets.VPS_HOST }}
           VPS_USER: ${{ secrets.VPS_USER }}
           VPS_PORT: ${{ secrets.VPS_PORT }}
           VPS_DEPLOY_DIR: ${{ secrets.VPS_DEPLOY_DIR }}
-          VPS_API_PORT: ${{ secrets.VPS_API_PORT }}
-          REPO_URL: https://github.com/${{ github.repository }}.git
+          VPS_NGINX_PORT: ${{ secrets.VPS_NGINX_PORT }}
+          IMAGE_REPO: ghcr.io/${{ github.repository }}
+          GHCR_USER: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           PORT="${VPS_PORT:-22}"
           DEPLOY_DIR="${VPS_DEPLOY_DIR:-/opt/batack-backend}"
-          API_PORT="${VPS_API_PORT:-8001}"
+          NGINX_PORT="${VPS_NGINX_PORT:-8085}"
+          IMAGE_LOWER="$(echo "$IMAGE_REPO" | tr '[:upper:]' '[:lower:]'):latest"
 
-          ssh -i ~/.ssh/deploy_key -p "$PORT" -o StrictHostKeyChecking=accept-new "${VPS_USER}@${VPS_HOST}" bash -s -- "$DEPLOY_DIR" "$REPO_URL" "$API_PORT" <<'EOF'
+          # Crée les dossiers runtime sur le VPS et transfère uniquement docker-compose.yml + nginx/ (aucun code source)
+          ssh -i ~/.ssh/deploy_key -p "$PORT" -o StrictHostKeyChecking=accept-new "${VPS_USER}@${VPS_HOST}" \
+            "mkdir -p '${DEPLOY_DIR}/storage/photos' '${DEPLOY_DIR}/storage/logos' '${DEPLOY_DIR}/storage/justificatifs' '${DEPLOY_DIR}/storage/documents' '${DEPLOY_DIR}/storage/autres' '${DEPLOY_DIR}/nginx/certs' '${DEPLOY_DIR}/nginx/certbot'"
+
+          tar -czf - docker-compose.yml nginx/templates nginx/modes nginx/30-configure-ssl.sh nginx/ssl.conf.example | \
+            ssh -i ~/.ssh/deploy_key -p "$PORT" -o StrictHostKeyChecking=accept-new "${VPS_USER}@${VPS_HOST}" \
+            "tar -xzf - -C '${DEPLOY_DIR}'"
+
+          printf '%s\n' "$GHCR_TOKEN" | ssh -i ~/.ssh/deploy_key -p "$PORT" -o StrictHostKeyChecking=accept-new \
+            "${VPS_USER}@${VPS_HOST}" "docker login ghcr.io -u '${GHCR_USER}' --password-stdin"
+
+          ssh -i ~/.ssh/deploy_key -p "$PORT" -o StrictHostKeyChecking=accept-new "${VPS_USER}@${VPS_HOST}" \
+            bash -s -- "$DEPLOY_DIR" "$NGINX_PORT" "$IMAGE_LOWER" <<'EOF'
           set -euo pipefail
           DEPLOY_DIR="$1"
-          REPO_URL="$2"
-          API_PORT="$3"
-
-          if [ ! -d "$DEPLOY_DIR/.git" ]; then
-            mkdir -p "$(dirname "$DEPLOY_DIR")"
-            git clone --branch main "$REPO_URL" "$DEPLOY_DIR"
-          fi
+          NGINX_PORT="$2"
+          API_IMAGE="$3"
 
           cd "$DEPLOY_DIR"
-          git fetch origin main
-          git checkout main
-          git reset --hard origin/main
-
           if [ ! -f .env ]; then
             echo "ERREUR : le fichier $DEPLOY_DIR/.env est absent sur le VPS."
-            echo "Copiez .env.example vers .env et renseignez vos secrets de production avant le prochain déploiement."
+            echo "Créez $DEPLOY_DIR/.env avant le déploiement (sans copier de code source)."
             exit 1
           fi
 
-          mkdir -p storage/photos storage/logos storage/justificatifs storage/documents storage/autres
-
+          export API_IMAGE
           docker compose up -d db redis --wait
-          docker compose build api
-          docker compose up -d api
+          docker compose pull api nginx
+          docker compose up -d --no-build --remove-orphans api nginx
+          docker logout ghcr.io >/dev/null 2>&1 || true
 
-          echo "Vérification de la santé de l'API sur http://127.0.0.1:${API_PORT}/api/v1/health..."
+          echo "Vérification de la santé via Nginx sur http://127.0.0.1:${NGINX_PORT}/api/v1/health..."
           for i in $(seq 1 20); do
-            if curl -fsS "http://127.0.0.1:${API_PORT}/api/v1/health" > /dev/null; then
+            if curl -fsS "http://127.0.0.1:${NGINX_PORT}/api/v1/health" > /dev/null; then
               echo "Déploiement réussi !"
               docker compose ps
               docker image prune -f > /dev/null 2>&1 || true
@@ -128,12 +180,11 @@ jobs:
             sleep 3
           done
 
-          echo "ERREUR : l'API n'a pas répondu à /api/v1/health après 60s."
-          docker compose logs --tail=80 api
+          echo "ERREUR : le reverse proxy Nginx/API n'a pas répondu à /api/v1/health après 60s."
+          docker compose logs --tail=80 api nginx
           exit 1
           EOF
 
       - name: Cleanup SSH key
         if: always()
         run: rm -f ~/.ssh/deploy_key
-
