@@ -163,10 +163,16 @@ jobs:
             exit 1
           fi
 
+          chown -R 1000:1000 storage 2>/dev/null || true
+
           export API_IMAGE
           docker compose up -d db redis --wait
           docker compose pull api nginx
-          docker compose up -d --no-build --remove-orphans api nginx
+          if ! docker compose up -d --no-build --remove-orphans api nginx; then
+            echo "ERREUR : échec du démarrage des conteneurs api/nginx. Logs récents :"
+            docker compose logs --tail=100 api nginx
+            exit 1
+          fi
           docker logout ghcr.io >/dev/null 2>&1 || true
 
           echo "Vérification de la santé via Nginx sur http://127.0.0.1:${NGINX_PORT}/api/v1/health..."
